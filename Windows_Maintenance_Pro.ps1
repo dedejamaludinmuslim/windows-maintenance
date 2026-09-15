@@ -1,17 +1,21 @@
 #requires -version 5.1
 <#
-Windows Maintenance Pro v3.2 - PowerShell Edition
+Windows Maintenance Pro v3.4 - PowerShell Edition
 Untuk Windows 10/11. Jalankan hanya dari sumber yang Anda percaya.
 #>
 
 [CmdletBinding()]
-param()
+param(
+    [ValidateSet('Audit','Protect')]
+    [string]$ScheduledPreset
+)
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
 
 $script:AppName = 'Windows Maintenance Pro'
-$script:AppVersion = '3.2 PowerShell'
+$script:AppVersion = '3.4 PowerShell'
+$script:ScheduledPreset = $ScheduledPreset
 $script:ProgramRoot = Join-Path $env:ProgramData 'WindowsMaintenancePro'
 $script:RunsRoot = Join-Path $script:ProgramRoot 'Runs'
 $script:Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -20,11 +24,14 @@ $script:BackupDir = Join-Path ([Environment]::GetFolderPath('Desktop')) "Windows
 $script:LogFile = Join-Path $script:RunDir 'maintenance.log'
 $script:UndoFile = Join-Path $script:RunDir 'undo-state.csv'
 $script:TaskResult = 'LEWATI'
+$script:LastTask = '--'
+$script:LastResult = 'Belum ada tugas dijalankan'
+$script:LastActivityTime = '--:--:--'
 $script:DryRun = $false
 $script:RepositoryUrl = ''
 $script:RepositoryRawUrl = ''
 $script:Status = @{}
-1..32 | ForEach-Object { $script:Status[('{0:D2}' -f $_)] = 'ANTRI' }
+1..40 | ForEach-Object { $script:Status[('{0:D2}' -f $_)] = 'ANTRI' }
 $script:UndoKeys = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:BatchSelected = New-Object 'System.Collections.Generic.HashSet[string]'
 
@@ -43,15 +50,17 @@ function Start-ElevatedCopy {
     Write-Host 'Hak Administrator diperlukan. Permintaan UAC akan ditampilkan.' -ForegroundColor Yellow
     if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
         Write-Host '[GAGAL] Simpan skrip sebagai file .ps1; jangan jalankan dengan IEX.' -ForegroundColor Red
-        Read-Host 'Tekan Enter untuk menutup'
+        if(-not $script:ScheduledPreset){Read-Host 'Tekan Enter untuk menutup'}
         return $false
     }
     try {
         $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
+        if ($script:ScheduledPreset) { $arguments += @('-ScheduledPreset', $script:ScheduledPreset) }
         $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Verb RunAs -ArgumentList $arguments -Wait -PassThru
         exit $process.ExitCode
     } catch {
         Write-Host "[GAGAL] Elevasi dibatalkan atau gagal: $($_.Exception.Message)" -ForegroundColor Red
+        if($script:ScheduledPreset){throw}
         Read-Host 'Tekan Enter untuk menutup'
         return $false
     }
@@ -191,6 +200,13 @@ function Register-FirewallUndo {
     }
 }
 
+function Register-OptionalFeatureUndo([string]$FeatureName) {
+    try {
+        $feature = Get-WindowsOptionalFeature -Online -FeatureName $FeatureName -ErrorAction Stop
+        Add-UndoRecord 'OptionalFeature' $FeatureName '' 'True' ([string]$feature.State) ''
+    } catch {}
+}
+
 function Invoke-UndoFile([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { Write-Host '[GAGAL] File Undo tidak ditemukan.'; return $false }
     $records = @(Import-Csv -LiteralPath $Path)
@@ -213,6 +229,13 @@ function Invoke-UndoFile([string]$Path) {
                     if ($record.Value -eq 'Running') { Start-Service $record.Target -ErrorAction SilentlyContinue } else { Stop-Service $record.Target -Force -ErrorAction SilentlyContinue }
                 }
                 'Firewall' { Set-NetFirewallProfile -Name $record.Target -Enabled ([bool]::Parse($record.Value)) }
+                'OptionalFeature' {
+                    if ($record.Value -like 'Enabled*') {
+                        Enable-WindowsOptionalFeature -Online -FeatureName $record.Target -All -NoRestart -ErrorAction Stop | Out-Null
+                    } else {
+                        Disable-WindowsOptionalFeature -Online -FeatureName $record.Target -NoRestart -ErrorAction Stop | Out-Null
+                    }
+                }
             }
         } catch { $failed++; Write-Host "[GAGAL] Undo $($record.Type) $($record.Target): $($_.Exception.Message)" -ForegroundColor Red }
     }
@@ -338,6 +361,14 @@ function Get-TaskPlan([string]$Number) {
         '30' { New-TaskPlan $Number 'Scan/download/install Windows Update' 'Tinggi' '10-180 menit' 'Mungkin' 'Windows rollback terbatas' }
         '31' { New-TaskPlan $Number 'Membuat laporan jaringan modern' 'Rendah' '1-5 menit' 'Tidak' 'Tidak perlu' }
         '32' { New-TaskPlan $Number 'Status/reliability/scan storage' 'Sedang' '1-60 menit' 'Mungkin' 'Tidak perlu' }
+        '33' { New-TaskPlan $Number 'Audit keamanan atau scan Defender lanjutan' 'Tinggi' '1-120 menit' 'Offline scan: Ya' 'Tidak perlu' }
+        '34' { New-TaskPlan $Number 'Kelola Windows Optional Features' 'Tinggi' '1-30 menit' 'Mungkin' 'Otomatis' }
+        '35' { New-TaskPlan $Number 'Inventaris atau nonaktifkan Registry startup' 'Sedang' '<5 menit' 'Tidak' 'Otomatis' }
+        '36' { New-TaskPlan $Number 'Inventaris atau hapus AppX current user' 'Tinggi' '1-10 menit' 'Tidak' 'Tidak otomatis' }
+        '37' { New-TaskPlan $Number 'Kelola jadwal Audit/Protect otomatis' 'Sedang' '<5 menit' 'Tidak' 'Hapus scheduled task' }
+        '38' { New-TaskPlan $Number 'Jalankan preset maintenance terpilih' 'Bervariasi' 'Bervariasi' 'Mungkin' 'Per tugas' }
+        '39' { New-TaskPlan $Number 'Validasi/test/terapkan WinGet Configuration' 'Tinggi' 'Bervariasi' 'Mungkin' 'Sesuai configuration' }
+        '40' { New-TaskPlan $Number 'Buat laporan kesehatan HTML lokal' 'Rendah' '1-5 menit' 'Tidak' 'Tidak perlu' }
         default { New-TaskPlan $Number 'Tugas tidak dikenal' 'Tidak diketahui' '-' '-' '-' }
     }
 }
@@ -376,6 +407,14 @@ function Get-TaskCommandSummary([string]$Number) {
         '30' {'Microsoft.Update.Session COM: Search/Download/Install'}
         '31' {'Get-NetAdapter/Get-NetIPConfiguration/Get-NetTCPConnection/Test-NetConnection'}
         '32' {'Get-PhysicalDisk/Get-StorageReliabilityCounter/Repair-Volume -Scan'}
+        '33' {'Get-MpComputerStatus/Get-NetFirewallProfile/Get-Tpm/Get-BitLockerVolume/Start-MpScan'}
+        '34' {'Get/Enable/Disable-WindowsOptionalFeature -Online -NoRestart'}
+        '35' {'Get-CimInstance Win32_StartupCommand; Registry Run inventory/disable'}
+        '36' {'Get-AppxPackage; Remove-AppxPackage current user'}
+        '37' {'New-ScheduledTaskAction/Trigger/Principal; Register/Unregister-ScheduledTask'}
+        '38' {'Preset Audit/Cepat/Standar/Perbaikan dengan konfirmasi per tugas'}
+        '39' {'winget configure list/show/validate/test/export/apply'}
+        '40' {'Get-CimInstance/Get-Volume/Get-MpComputerStatus/ConvertTo-Html'}
         default {'Tidak tersedia'}
     }
 }
@@ -403,6 +442,8 @@ function Get-LiveState([string]$Number) {
             '29' { $r=@(Get-ComputerRestorePoint -ErrorAction Stop);if($r.Count){"$($r.Count) restore point"}else{'Belum ada'} }
             '30' { if(Test-PendingReboot){'Restart tertunda'}else{'WUA siap'} }
             '32' { $bad=@(Get-PhysicalDisk -ErrorAction Stop|Where-Object HealthStatus -ne 'Healthy');if($bad.Count){"$($bad.Count) disk bermasalah"}else{'Disk healthy'} }
+            '33' { $d=Get-MpComputerStatus -ErrorAction Stop;$f=@(Get-NetFirewallProfile -ErrorAction Stop|Where-Object{-not $_.Enabled});if($d.RealTimeProtectionEnabled -and -not $f.Count){'Proteksi inti aktif'}else{'Perlu diperiksa'} }
+            '37' { $t=@(Get-ScheduledTask -TaskName 'WindowsMaintenancePro-*' -ErrorAction SilentlyContinue);if($t.Count){"$($t.Count) jadwal aktif"}else{'Belum dijadwalkan'} }
             default { '' }
         }
     } catch { 'Status N/A' }
@@ -422,9 +463,9 @@ function Show-BatchMenu {
         Write-Host ('=' * 72)
         $selected = @($script:BatchSelected | Sort-Object)
         Write-Host "Terpilih: $(if($selected.Count){$selected -join ', '}else{'belum ada'})"
-        Write-Host "`nTekan dua digit 01-32 untuk memilih/membatalkan pilihan."
+        Write-Host "`nTekan dua digit 01-40 untuk memilih/membatalkan pilihan."
         Write-Host "R = Tinjau dan jalankan`nC = Kosongkan pilihan`nN = Kembali`n? = Informasi"
-        $first = Read-OneKey '0123RCN?' 'Silakan pilih: ' -NoEcho
+        $first = Read-OneKey '01234RCN?' 'Silakan pilih: ' -NoEcho
         if ($first -eq 'R') {
             Write-Host 'R'
             if (-not $selected.Count) { Write-Host 'Belum ada tugas terpilih.'; Wait-Key; continue }
@@ -440,7 +481,7 @@ function Show-BatchMenu {
         if ($first -eq 'C') { Write-Host 'C'; $script:BatchSelected.Clear(); continue }
         if ($first -eq 'N') { Write-Host 'N'; return }
         if ($first -eq '?') { Write-Host "?`nBatch menyusun antrean. Tugas dijalankan berurutan dan konfirmasi per tugas tetap berlaku."; Wait-Key; continue }
-        $allowed = if ($first -eq '3') {'012'} else {'0123456789'}
+        $allowed = if ($first -eq '4') {'0'} else {'0123456789'}
         $second = Read-OneKey $allowed 'Digit kedua: ' -NoEcho
         $number = "$first$second"; Write-Host $number
         if ($number -eq '00') { continue }
@@ -461,7 +502,7 @@ function Show-UndoCenter {
         for ($i=1;$i -le $files.Count;$i++) { $allowed += [string]$i }
         $choice = Read-OneKey $allowed 'Silakan pilih: '
         if ($choice -eq 'N') { return }
-        if ($choice -eq '?') { Write-Host "`nUndo bekerja hanya untuk perubahan yang dicatat: registry, power plan, Hibernate, service, dan Firewall.`nPembersihan file, update, DISM, uninstall aplikasi, dan reset Winsock tidak dibalik otomatis."; Wait-Key; continue }
+        if ($choice -eq '?') { Write-Host "`nUndo bekerja hanya untuk perubahan yang dicatat: registry, power plan, Hibernate, service, Firewall, dan Optional Features.`nPembersihan file, update, DISM, uninstall aplikasi/AppX, scheduler, dan reset Winsock tidak dibalik otomatis."; Wait-Key; continue }
         $index = [int]$choice - 1
         $target = $files[$index]
         if ($script:DryRun) {
@@ -471,7 +512,7 @@ function Show-UndoCenter {
             continue
         }
         if (Read-Confirm "Pulihkan perubahan sesi $($target.Directory.Name)?" 'Record dijalankan dari perubahan terakhir ke pertama. Proses tidak dapat dibatalkan di tengah jalan.') {
-            if (Invoke-UndoFile $target.FullName) { '09','10','11','12','13','24','25','26' | ForEach-Object { $script:Status[$_] = 'ANTRI' } }
+            if (Invoke-UndoFile $target.FullName) { '09','10','11','12','13','24','25','26','34','35' | ForEach-Object { $script:Status[$_] = 'ANTRI' } }
             Wait-Key
         }
     }
@@ -510,7 +551,7 @@ function Get-DashboardStateSnapshot {
         $WarningPreference = 'SilentlyContinue'
         $VerbosePreference = 'SilentlyContinue'
         $InformationPreference = 'SilentlyContinue'
-        foreach ($number in '05','07','09','10','11','12','13','25','26','29','30','32') {
+        foreach ($number in '05','07','09','10','11','12','13','25','26','29','30','32','33','37') {
             $snapshot[$number] = [string](Get-StateSuffix $number)
         }
     } finally {
@@ -522,7 +563,83 @@ function Get-DashboardStateSnapshot {
     return $snapshot
 }
 
-function Show-Dashboard {
+function Get-CategoryCatalog {
+    return @(
+        [pscustomobject]@{Key='1';Code='A';Name='Prioritas dan Pembersihan';First='01';Last='04'},
+        [pscustomobject]@{Key='2';Code='B';Name='Update dan Keamanan';First='05';Last='07'},
+        [pscustomobject]@{Key='3';Code='C';Name='Jaringan dan Pengaturan';First='08';Last='13'},
+        [pscustomobject]@{Key='4';Code='D';Name='Privasi, Laporan, Backup';First='14';Last='18'},
+        [pscustomobject]@{Key='5';Code='E';Name='Repair dan Optimasi';First='19';Last='23'},
+        [pscustomobject]@{Key='6';Code='F';Name='Tweak dan Quick Fix';First='24';Last='28'},
+        [pscustomobject]@{Key='7';Code='G';Name='PowerShell Insight';First='29';Last='32'},
+        [pscustomobject]@{Key='8';Code='H';Name='Windows AIO';First='33';Last='40'}
+    )
+}
+
+function Get-TaskCatalog {
+    return @(
+        [pscustomobject]@{No='01';Category='1';Title='Backup konfigurasi dasar'},
+        [pscustomobject]@{No='02';Category='1';Title='Ekspor daftar aplikasi Winget'},
+        [pscustomobject]@{No='03';Category='1';Title='Bersihkan temporary files'},
+        [pscustomobject]@{No='04';Category='1';Title='Disk Cleanup tanpa menunggu'},
+        [pscustomobject]@{No='05';Category='2';Title='Manajemen aplikasi Winget'},
+        [pscustomobject]@{No='06';Category='2';Title='Buka Windows Update'},
+        [pscustomobject]@{No='07';Category='2';Title='Update dan Quick Scan Defender'},
+        [pscustomobject]@{No='08';Category='3';Title='Pemeliharaan jaringan'},
+        [pscustomobject]@{No='09';Category='3';Title='Power Plan'},
+        [pscustomobject]@{No='10';Category='3';Title='Hibernate dan Fast Startup'},
+        [pscustomobject]@{No='11';Category='3';Title='Service SysMain'},
+        [pscustomobject]@{No='12';Category='3';Title='Windows Search Indexing'},
+        [pscustomobject]@{No='13';Category='3';Title='Settings Center'},
+        [pscustomobject]@{No='14';Category='4';Title='Registry Privacy Cleanup'},
+        [pscustomobject]@{No='15';Category='4';Title='Diagnosis sistem'},
+        [pscustomobject]@{No='16';Category='4';Title='Riwayat maintenance'},
+        [pscustomobject]@{No='17';Category='4';Title='Battery dan Energy Report'},
+        [pscustomobject]@{No='18';Category='4';Title='Backup driver pihak ketiga'},
+        [pscustomobject]@{No='19';Category='5';Title='Optimasi drive'},
+        [pscustomobject]@{No='20';Category='5';Title='CHKDSK online scan'},
+        [pscustomobject]@{No='21';Category='5';Title='Reset cache Windows Update'},
+        [pscustomobject]@{No='22';Category='5';Title='Component Store Cleanup'},
+        [pscustomobject]@{No='23';Category='5';Title='Perbaikan DISM dan SFC'},
+        [pscustomobject]@{No='24';Category='6';Title='Visual dan produktivitas Windows'},
+        [pscustomobject]@{No='25';Category='6';Title='Delivery Optimization'},
+        [pscustomobject]@{No='26';Category='6';Title='Storage Sense terkontrol'},
+        [pscustomobject]@{No='27';Category='6';Title='Pusat perbaikan cepat'},
+        [pscustomobject]@{No='28';Category='6';Title='Laporan Wi-Fi dan startup'},
+        [pscustomobject]@{No='29';Category='7';Title='System Restore Point'},
+        [pscustomobject]@{No='30';Category='7';Title='Windows Update inline (WUA)'},
+        [pscustomobject]@{No='31';Category='7';Title='Diagnostik jaringan modern'},
+        [pscustomobject]@{No='32';Category='7';Title='Kesehatan storage PowerShell'},
+        [pscustomobject]@{No='33';Category='8';Title='Security Center'},
+        [pscustomobject]@{No='34';Category='8';Title='Windows Optional Features'},
+        [pscustomobject]@{No='35';Category='8';Title='Startup Manager'},
+        [pscustomobject]@{No='36';Category='8';Title='AppX Manager'},
+        [pscustomobject]@{No='37';Category='8';Title='Maintenance Scheduler'},
+        [pscustomobject]@{No='38';Category='8';Title='Maintenance Presets'},
+        [pscustomobject]@{No='39';Category='8';Title='WinGet Configuration'},
+        [pscustomobject]@{No='40';Category='8';Title='Laporan kesehatan HTML'}
+    )
+}
+
+function Get-StatusView([string]$Status) {
+    switch($Status){
+        'SELESAI' {[pscustomobject]@{Badge='DONE';Color='Green'}}
+        'PRATINJAU' {[pscustomobject]@{Badge='DRY ';Color='Cyan'}}
+        'LEWATI' {[pscustomobject]@{Badge='SKIP';Color='Yellow'}}
+        'GAGAL' {[pscustomobject]@{Badge='FAIL';Color='Red'}}
+        default {[pscustomobject]@{Badge='WAIT';Color='DarkGray'}}
+    }
+}
+
+function Write-TaskRow([object]$Task,[hashtable]$LiveState) {
+    $view=Get-StatusView $script:Status[$Task.No]
+    Write-Host '[' -NoNewline -ForegroundColor DarkGray
+    Write-Host $view.Badge -NoNewline -ForegroundColor $view.Color
+    Write-Host ('] {0}. {1}' -f $Task.No,$Task.Title) -NoNewline
+    if($LiveState -and $LiveState.ContainsKey($Task.No) -and $LiveState[$Task.No]){Write-Host $LiveState[$Task.No] -ForegroundColor DarkCyan}else{Write-Host}
+}
+
+function Show-FullTaskList {
     # Ambil seluruh status sebelum mencetak menu agar output pemeriksaan tidak
     # dapat menyisip atau menimpa baris dashboard yang sudah tampil.
     $live = Get-DashboardStateSnapshot
@@ -578,8 +695,125 @@ Mode Dry Run: $dryRunText
 [$($script:Status['30'])] 30. Windows Update inline (WUA)$($live['30'])
 [$($script:Status['31'])] 31. Diagnostik jaringan modern
 [$($script:Status['32'])] 32. Kesehatan storage PowerShell$($live['32'])
+
+[H - WINDOWS AIO v3.4]
+[$($script:Status['33'])] 33. Security Center$($live['33'])
+[$($script:Status['34'])] 34. Windows Optional Features
+[$($script:Status['35'])] 35. Startup Manager
+[$($script:Status['36'])] 36. AppX Manager
+[$($script:Status['37'])] 37. Maintenance Scheduler$($live['37'])
+[$($script:Status['38'])] 38. Maintenance Presets
+[$($script:Status['39'])] 39. WinGet Configuration
+[$($script:Status['40'])] 40. Laporan kesehatan HTML
 "@
     Write-Host $dashboard
+}
+
+function Show-Dashboard {
+    $live=Get-DashboardStateSnapshot
+    $catalog=@(Get-TaskCatalog)
+    $categories=@(Get-CategoryCatalog)
+    $done=@($script:Status.Values|Where-Object{$_ -eq 'SELESAI'}).Count
+    $dry=@($script:Status.Values|Where-Object{$_ -eq 'PRATINJAU'}).Count
+    $failed=@($script:Status.Values|Where-Object{$_ -eq 'GAGAL'}).Count
+    $skipped=@($script:Status.Values|Where-Object{$_ -eq 'LEWATI'}).Count
+    $pending=@($script:Status.Values|Where-Object{$_ -eq 'ANTRI'}).Count
+    $mode=if($script:DryRun){'DRY RUN'}else{'LIVE'}
+    $modeColor=if($script:DryRun){'Yellow'}else{'Green'}
+    try{$Host.UI.RawUI.WindowTitle="$($script:AppName) $($script:AppVersion)"}catch{}
+
+    Write-Host ('='*78) -ForegroundColor DarkCyan
+    Write-Host '  WINDOWS MAINTENANCE PRO' -NoNewline -ForegroundColor Cyan
+    Write-Host "  |  v$($script:AppVersion.Replace(' PowerShell',''))" -NoNewline -ForegroundColor White
+    Write-Host "  |  $mode" -ForegroundColor $modeColor
+    Write-Host ('='*78) -ForegroundColor DarkCyan
+    Write-Host ("  PC: {0}   User: {1}   Time: {2}" -f $env:COMPUTERNAME,$env:USERNAME,(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) -ForegroundColor Gray
+    Write-Host ("  Defender{0} | Power{1} | Update{2}" -f $live['07'],$live['09'],$live['30'])
+    Write-Host ("  Storage{0} | Scheduler{1}" -f $live['32'],$live['37'])
+    Write-Host ('-'*78) -ForegroundColor DarkGray
+    Write-Host '  KATEGORI TUGAS' -ForegroundColor Cyan
+    foreach($category in $categories){
+        $items=@($catalog|Where-Object Category -eq $category.Key)
+        $categoryDone=@($items|Where-Object{$script:Status[$_.No] -eq 'SELESAI'}).Count
+        $categoryFail=@($items|Where-Object{$script:Status[$_.No] -eq 'GAGAL'}).Count
+        $color=if($categoryFail){'Red'}elseif($categoryDone -eq $items.Count){'Green'}elseif($categoryDone){'Cyan'}else{'Gray'}
+        Write-Host ("  ({0}) [{1}] {2,-27} {3}-{4}   {5}/{6} selesai" -f $category.Key,$category.Code,$category.Name,$category.First,$category.Last,$categoryDone,$items.Count) -ForegroundColor $color
+    }
+    Write-Host ('-'*78) -ForegroundColor DarkGray
+    Write-Host ("  PROGRES   Selesai:{0}  Dry:{1}  Lewati:{2}  Gagal:{3}  Antri:{4}" -f $done,$dry,$skipped,$failed,$pending) -ForegroundColor White
+    if($script:LastTask -ne '--'){
+        $lastTitle=($catalog|Where-Object No -eq $script:LastTask|Select-Object -First 1).Title
+        Write-Host ("  TERAKHIR  {0} {1} -> {2} pukul {3}" -f $script:LastTask,$lastTitle,$script:LastResult,$script:LastActivityTime) -ForegroundColor DarkCyan
+    }else{Write-Host '  TERAKHIR  Belum ada tugas dijalankan' -ForegroundColor DarkGray}
+    Write-Host ('-'*78) -ForegroundColor DarkGray
+    Write-Host '  K Katalog   F Cari   L Semua tugas   R Refresh   01-40 Jalankan' -ForegroundColor Cyan
+    Write-Host '  P Preset     B Batch  D Dry Run       U Undo      V Integrity' -ForegroundColor Gray
+    Write-Host '  I Bantuan    00 Selesai' -ForegroundColor Gray
+}
+
+function Show-CategoryTasks([string]$CategoryKey) {
+    $category=Get-CategoryCatalog|Where-Object Key -eq $CategoryKey|Select-Object -First 1
+    $items=@(Get-TaskCatalog|Where-Object Category -eq $CategoryKey)
+    while($true){
+        $live=Get-DashboardStateSnapshot
+        Clear-Host
+        Write-Host ('='*78) -ForegroundColor DarkCyan
+        Write-Host ("  KATEGORI {0} - {1} ({2}-{3})" -f $category.Code,$category.Name,$category.First,$category.Last) -ForegroundColor Cyan
+        Write-Host ('='*78) -ForegroundColor DarkCyan
+        foreach($task in $items){Write-TaskRow $task $live}
+        Write-Host ('-'*78) -ForegroundColor DarkGray
+        Write-Host '  Ketik dua digit nomor tugas | M = Kembali | ? = Informasi' -ForegroundColor Gray
+        $first=Read-OneKey '01234M?' '  Pilihan: ' -NoEcho
+        if($first -eq 'M'){Write-Host 'M';return $false}
+        if($first -eq '?'){Write-Host "?`nStatus: WAIT belum dijalankan, DONE selesai, DRY pratinjau, SKIP dibatalkan, FAIL gagal.";Wait-Key;continue}
+        $allowed=if($first -eq '4'){'0'}else{'0123456789'}
+        $second=Read-OneKey $allowed 'Digit kedua: ' -NoEcho
+        $number="$first$second";Write-Host $number
+        if($items.No -notcontains $number){Write-Host '[GAGAL] Nomor tersebut tidak berada dalam kategori ini.' -ForegroundColor Red;Wait-Key;continue}
+        Invoke-Task $number
+        return $true
+    }
+}
+
+function Show-TaskCatalog {
+    while($true){
+        Clear-Host
+        Write-Host ('='*78) -ForegroundColor DarkCyan
+        Write-Host '  KATALOG TUGAS - PILIH KATEGORI' -ForegroundColor Cyan
+        Write-Host ('='*78) -ForegroundColor DarkCyan
+        foreach($category in (Get-CategoryCatalog)){Write-Host ("  {0} = [{1}] {2,-28} Tugas {3}-{4}" -f $category.Key,$category.Code,$category.Name,$category.First,$category.Last)}
+        Write-Host "`n  N = Kembali   ? = Informasi" -ForegroundColor Gray
+        $choice=Read-OneKey '12345678N?' '  Silakan pilih: '
+        if($choice -eq 'N'){return}
+        if($choice -eq '?'){Write-Host 'Pilih kategori dengan satu tombol. Di halaman berikutnya, jalankan tugas menggunakan dua digit tanpa Enter.';Wait-Key;continue}
+        if(Show-CategoryTasks $choice){return}
+    }
+}
+
+function Show-TaskFinder {
+    Clear-Host
+    Write-Host ('='*78) -ForegroundColor DarkCyan
+    Write-Host '  CARI TUGAS' -ForegroundColor Cyan
+    Write-Host ('='*78) -ForegroundColor DarkCyan
+    $keyword=(Read-Host '  Kata kunci, kosong untuk kembali').Trim()
+    if(-not $keyword){return}
+    $results=@(Get-TaskCatalog|Where-Object{$_.Title.IndexOf($keyword,[StringComparison]::OrdinalIgnoreCase) -ge 0})
+    if(-not $results.Count){Write-Host "`n  Tidak ada tugas yang cocok dengan '$keyword'." -ForegroundColor Yellow;Wait-Key;return}
+    $live=Get-DashboardStateSnapshot
+    Write-Host "`n  Ditemukan $($results.Count) tugas:`n" -ForegroundColor Cyan
+    foreach($task in $results){Write-TaskRow $task $live}
+    while($true){
+        Write-Host "`n  Ketik dua digit nomor hasil | N = Kembali | ? = Informasi" -ForegroundColor Gray
+        $first=Read-OneKey '01234N?' '  Pilihan: ' -NoEcho
+        if($first -eq 'N'){Write-Host 'N';return}
+        if($first -eq '?'){Write-Host '?`nPencarian tidak mengeksekusi tugas. Hanya nomor yang tampil pada hasil yang dapat dipilih.';continue}
+        $allowed=if($first -eq '4'){'0'}else{'0123456789'}
+        $second=Read-OneKey $allowed 'Digit kedua: ' -NoEcho
+        $number="$first$second";Write-Host $number
+        if($results.No -notcontains $number){Write-Host '[GAGAL] Nomor tidak terdapat pada hasil pencarian.' -ForegroundColor Red;continue}
+        Invoke-Task $number
+        return
+    }
 }
 
 function Show-MainHelp {
@@ -590,10 +824,13 @@ INFORMASI
 - Semua menu dan konfirmasi langsung diproses dengan satu tombol.
 - Pada konfirmasi Y/N/?, tombol ? menampilkan informasi lalu mengulang pertanyaan.
 - Enter hanya dipakai untuk teks bebas seperti Package ID.
+- Tugas tersedia dari 01 sampai 40; fitur AIO berada pada 33-40.
+- K membuka katalog kategori; F mencari judul tugas; L menampilkan seluruh tugas.
+- R memperbarui control center dan status live tanpa menjalankan tugas.
 - D mengaktifkan Dry Run; tugas hanya menampilkan rencana dan tidak dieksekusi.
 - B membuka Batch Task; U membuka Undo Center; V membuka Integrity Center.
 - Tugas berstatus SELESAI meminta izin sebelum dijalankan ulang.
-- ANTRI = belum dijalankan; PRATINJAU = Dry Run; LEWATI = dibatalkan; GAGAL = error.
+- WAIT = belum dijalankan; DONE = selesai; DRY = Dry Run; SKIP = dibatalkan; FAIL = gagal.
 '@
     Wait-Key
 }
@@ -602,6 +839,9 @@ function Invoke-Task([string]$Number) {
     if ($script:DryRun) {
         Show-TaskPlan $Number
         $script:Status[$Number] = 'PRATINJAU'
+        $script:LastTask = $Number
+        $script:LastResult = 'PRATINJAU'
+        $script:LastActivityTime = Get-Date -Format 'HH:mm:ss'
         Write-Log "Dry Run tugas $Number"
         Wait-Key
         return
@@ -619,6 +859,9 @@ function Invoke-Task([string]$Number) {
         $script:TaskResult = 'GAGAL'
     }
     $script:Status[$Number] = $script:TaskResult
+    $script:LastTask = $Number
+    $script:LastResult = $script:TaskResult
+    $script:LastActivityTime = Get-Date -Format 'HH:mm:ss'
     Write-Log "Tugas $Number`: $($script:TaskResult)"
     Clear-Host
     Show-Dashboard
@@ -1040,17 +1283,301 @@ function Invoke-Task32 {
     }
 }
 
+function Get-SecurityOverview {
+    $defender = if(Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue){Get-MpComputerStatus -ErrorAction SilentlyContinue}else{$null}
+    $firewall = if(Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue){@(Get-NetFirewallProfile -ErrorAction SilentlyContinue)}else{@()}
+    $tpm = if(Get-Command Get-Tpm -ErrorAction SilentlyContinue){Get-Tpm -ErrorAction SilentlyContinue}else{$null}
+    $secureBoot = if(Get-Command Confirm-SecureBootUEFI -ErrorAction SilentlyContinue){try { if (Confirm-SecureBootUEFI -ErrorAction Stop) { 'Aktif' } else { 'Nonaktif' } } catch { 'Tidak tersedia/Legacy BIOS' }}else{'Tidak tersedia'}
+    $bitLocker = if(Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue){try {
+        $volumes = @(Get-BitLockerVolume -ErrorAction Stop)
+        if ($volumes.Count) { ($volumes | ForEach-Object { "$($_.MountPoint):$($_.ProtectionStatus)" }) -join '; ' } else { 'Tidak tersedia' }
+    } catch { 'Tidak tersedia' }}else{'Tidak tersedia'}
+    [pscustomobject][ordered]@{
+        DefenderRealtime = if ($defender) { $defender.RealTimeProtectionEnabled } else { 'N/A' }
+        DefenderAntivirus = if ($defender) { $defender.AntivirusEnabled } else { 'N/A' }
+        SignatureAgeDays = if ($defender) { $defender.AntivirusSignatureAge } else { 'N/A' }
+        QuickScanAgeDays = if ($defender) { $defender.QuickScanAge } else { 'N/A' }
+        FirewallDisabled = @($firewall | Where-Object { -not $_.Enabled }).Count
+        SecureBoot = $secureBoot
+        TpmPresent = if ($tpm) { $tpm.TpmPresent } else { 'N/A' }
+        TpmReady = if ($tpm) { $tpm.TpmReady } else { 'N/A' }
+        BitLocker = $bitLocker
+        PendingRestart = Test-PendingReboot
+    }
+}
+
+function Invoke-Task33 {
+    $used = $false
+    while ($true) {
+        Clear-Host
+        Write-Host "TUGAS 33 - SECURITY CENTER`n`nS = Audit ringkas keamanan`nQ = Defender Quick Scan`nF = Defender Full Scan`nO = Microsoft Defender Offline Scan`nW = Buka Windows Security`nN = Kembali`n? = Informasi"
+        switch (Read-OneKey 'SQFOWN?' 'Silakan pilih sesuai tombol: ') {
+            'S' { Get-SecurityOverview | Format-List; $used=$true; Wait-Key }
+            'Q' { if(Read-Confirm 'Update signature dan jalankan Quick Scan?' 'Memeriksa area yang paling sering dipakai malware.') { try{Update-MpSignature -ErrorAction Stop;Start-MpScan -ScanType QuickScan -ErrorAction Stop;$used=$true}catch{Write-Host "[GAGAL] $_"} };Wait-Key }
+            'F' { if(Read-Confirm 'Jalankan Defender Full Scan?' 'Memeriksa seluruh file dan dapat berlangsung lama. Sambungkan laptop ke listrik.') { try{Update-MpSignature -ErrorAction Stop;Start-MpScan -ScanType FullScan -ErrorAction Stop;$used=$true}catch{Write-Host "[GAGAL] $_"} };Wait-Key }
+            'O' { if(Read-Confirm 'Mulai Microsoft Defender Offline Scan?' 'Komputer dapat restart untuk memindai di luar Windows. Simpan seluruh pekerjaan sebelum memilih Y.') { try{Start-MpWDOScan -ErrorAction Stop;$used=$true}catch{Write-Host "[GAGAL] $_"};Wait-Key } }
+            'W' { Start-Process 'windowsdefender:'; $used=$true }
+            'N' { if($used){$script:TaskResult='SELESAI'};return }
+            '?' { Write-Host 'Audit hanya membaca status. Full Scan lama. Offline Scan dapat memulai ulang komputer dan dipakai bila dicurigai ada malware yang bertahan saat Windows aktif.';Wait-Key }
+        }
+    }
+}
+
+function Read-OptionalFeatureName {
+    $name = (Read-Host 'FeatureName exact, kosong untuk batal').Trim()
+    if (-not $name) { return $null }
+    if ($name -notmatch '^[A-Za-z0-9._+\-]+$') { Write-Host '[GAGAL] FeatureName tidak valid.' -ForegroundColor Red; return $null }
+    return $name
+}
+
+function Invoke-Task34 {
+    $changed = $false
+    while ($true) {
+        Clear-Host
+        Write-Host "TUGAS 34 - WINDOWS OPTIONAL FEATURES`n`nL = Daftar feature dan status`nE = Aktifkan FeatureName`nD = Nonaktifkan FeatureName`nO = Buka Windows Features`nN = Kembali`n? = Informasi"
+        switch (Read-OneKey 'LEDON?' 'Silakan pilih sesuai tombol: ') {
+            'L' {
+                $features = @(Get-WindowsOptionalFeature -Online -ErrorAction SilentlyContinue | Sort-Object FeatureName)
+                $features | Format-Table FeatureName,State -AutoSize
+                $file=Join-Path $script:RunDir 'windows-optional-features.csv';$features|Select-Object FeatureName,State|Export-Csv $file -NoTypeInformation -Encoding UTF8
+                Write-Host "`nDaftar lengkap: $file";Wait-Key
+            }
+            'E' {
+                $name=Read-OptionalFeatureName
+                if($name){$feature=Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction SilentlyContinue;if(-not $feature){Write-Host '[GAGAL] FeatureName tidak ditemukan.'}elseif(Read-Confirm "Aktifkan $name?" "State saat ini: $($feature.State). Dependency ikut diaktifkan; restart mungkin diperlukan tetapi tidak dilakukan otomatis."){Register-OptionalFeatureUndo $name;try{Enable-WindowsOptionalFeature -Online -FeatureName $name -All -NoRestart -ErrorAction Stop|Out-Null;$changed=$true}catch{Write-Host "[GAGAL] $_"}}};Wait-Key
+            }
+            'D' {
+                $name=Read-OptionalFeatureName
+                if($name){$feature=Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction SilentlyContinue;if(-not $feature){Write-Host '[GAGAL] FeatureName tidak ditemukan.'}elseif(Read-Confirm "Nonaktifkan $name?" "State saat ini: $($feature.State). Payload tidak dihapus dan restart tidak dilakukan otomatis."){Register-OptionalFeatureUndo $name;try{Disable-WindowsOptionalFeature -Online -FeatureName $name -NoRestart -ErrorAction Stop|Out-Null;$changed=$true}catch{Write-Host "[GAGAL] $_"}}};Wait-Key
+            }
+            'O' { Start-Process optionalfeatures.exe }
+            'N' { if($changed){$script:TaskResult='SELESAI'};return }
+            '?' { Write-Host 'Gunakan daftar untuk menyalin FeatureName exact. Skrip tidak memakai opsi Remove, sehingga payload komponen tidak sengaja dihapus. Keadaan awal dicatat di Undo Center.';Wait-Key }
+        }
+    }
+}
+
+function Get-StartupRegistryEntries {
+    $locations = @(
+        [pscustomobject]@{Scope='User';Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'},
+        [pscustomobject]@{Scope='Machine';Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'},
+        [pscustomobject]@{Scope='Machine32';Path='HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'}
+    )
+    foreach ($location in $locations) {
+        if (-not (Test-Path -LiteralPath $location.Path)) { continue }
+        $item = Get-Item -LiteralPath $location.Path -ErrorAction SilentlyContinue
+        foreach ($name in @($item.GetValueNames())) {
+            [pscustomobject][ordered]@{Scope=$location.Scope;Name=$name;Command=[string]$item.GetValue($name);RegistryPath=$location.Path}
+        }
+    }
+}
+
+function Invoke-Task35 {
+    $changed=$false
+    $pathMap=@{'U'='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run';'M'='HKLM:\Software\Microsoft\Windows\CurrentVersion\Run';'W'='HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'}
+    while($true){
+        Clear-Host
+        Write-Host "TUGAS 35 - STARTUP MANAGER`n`nL = Daftar lengkap Registry startup`nD = Nonaktifkan satu entri Registry Run`nO = Buka Startup Apps Settings`nN = Kembali`n? = Informasi"
+        switch(Read-OneKey 'LDON?' 'Silakan pilih sesuai tombol: '){
+            'L' {$entries=@(Get-StartupRegistryEntries);$entries|Format-List Scope,Name,Command;$file=Join-Path $script:RunDir 'startup-registry.csv';$entries|Export-Csv $file -NoTypeInformation -Encoding UTF8;Write-Host "Daftar lengkap: $file";$changed=$true;Wait-Key}
+            'D' {
+                Write-Host "`nU = Current user`nM = Machine 64-bit`nW = Machine 32-bit`nN = Batal"
+                $scope=Read-OneKey 'UMWN' 'Pilih lokasi: '
+                if($scope -ne 'N'){$path=$pathMap[$scope];$name=(Read-Host 'Nama value exact, kosong untuk batal').Trim();if($name){$item=Get-Item -LiteralPath $path -ErrorAction SilentlyContinue;if(-not $item -or $item.GetValueNames() -notcontains $name){Write-Host '[GAGAL] Entri tidak ditemukan pada lokasi tersebut.'}else{$command=[string]$item.GetValue($name);Write-Host "Perintah: $command";if(Read-Confirm "Nonaktifkan startup '$name'?" 'Value dicatat di Undo Center lalu dihapus dari Registry Run. File aplikasinya tidak dihapus.'){Register-RegistryUndo $path $name;Remove-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop;$changed=$true}}}};Wait-Key
+            }
+            'O' {Start-Process 'ms-settings:startupapps'}
+            'N' {if($changed){$script:TaskResult='SELESAI'};return}
+            '?' {Write-Host 'Fitur ini hanya mengelola Registry Run yang jelas dan dapat di-Undo. Service, driver, serta scheduled task tidak dinonaktifkan otomatis.';Wait-Key}
+        }
+    }
+}
+
+function Invoke-Task36 {
+    $changed=$false
+    while($true){
+        Clear-Host
+        Write-Host "TUGAS 36 - APPX MANAGER`n`nL = Daftar AppX current user + PackageFullName`nX = Hapus satu AppX current user`nO = Buka Installed Apps Settings`nN = Kembali`n? = Informasi"
+        switch(Read-OneKey 'LXON?' 'Silakan pilih sesuai tombol: '){
+            'L' {$packages=@(Get-AppxPackage|Sort-Object Name);$packages|Format-List Name,Version,PackageFullName,Publisher;$file=Join-Path $script:RunDir 'appx-current-user.csv';$packages|Select-Object Name,Version,PackageFullName,Publisher|Export-Csv $file -NoTypeInformation -Encoding UTF8;Write-Host "Daftar lengkap: $file";$changed=$true;Wait-Key}
+            'X' {$fullName=(Read-Host 'PackageFullName exact, kosong untuk batal').Trim();if($fullName){$package=Get-AppxPackage|Where-Object PackageFullName -eq $fullName|Select-Object -First 1;if(-not $package){Write-Host '[GAGAL] PackageFullName tidak ditemukan untuk pengguna aktif.'}else{Write-Host "Nama: $($package.Name)`nPublisher: $($package.Publisher)";if(Read-Confirm "Hapus AppX $($package.Name) untuk pengguna aktif?" 'Tidak memakai AllUsers dan tidak menghapus provisioned package. Undo otomatis tidak tersedia; instal ulang mungkin memerlukan Microsoft Store.'){try{Remove-AppxPackage -Package $package.PackageFullName -ErrorAction Stop;Write-Log "AppX removed: $($package.PackageFullName)";$changed=$true}catch{Write-Host "[GAGAL] $_"}}}};Wait-Key}
+            'O' {Start-Process 'ms-settings:appsfeatures'}
+            'N' {if($changed){$script:TaskResult='SELESAI'};return}
+            '?' {Write-Host 'Tidak ada debloat massal. Hanya PackageFullName exact milik pengguna aktif yang dapat dipilih, dan beberapa komponen Windows memang dilindungi.';Wait-Key}
+        }
+    }
+}
+
+function Read-Time24 {
+    $time=(Read-Host 'Waktu format HH:mm, contoh 19:30; kosong untuk batal').Trim()
+    if(-not $time){return $null}
+    if($time -notmatch '^(?:[01][0-9]|2[0-3]):[0-5][0-9]$'){Write-Host '[GAGAL] Format waktu harus HH:mm (00:00-23:59).';return $null}
+    return $time
+}
+
+function Register-MaintenanceSchedule([string]$Preset,[string]$Frequency,[string]$TimeText) {
+    if(-not $PSCommandPath -or -not(Test-Path -LiteralPath $PSCommandPath)){throw 'File skrip aktif tidak ditemukan.'}
+    $installDir=Join-Path $script:ProgramRoot 'Scheduled'
+    New-Item -ItemType Directory -Path $installDir -Force|Out-Null
+    $installedScript=Join-Path $installDir 'Windows_Maintenance_Pro_v3.4_PowerShell.ps1'
+    if([IO.Path]::GetFullPath($PSCommandPath) -ne [IO.Path]::GetFullPath($installedScript)){
+        Copy-Item -LiteralPath $PSCommandPath -Destination $installedScript -Force
+    }
+    $powerShellExe=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $arguments="-NoProfile -ExecutionPolicy Bypass -File `"$installedScript`" -ScheduledPreset $Preset"
+    $action=New-ScheduledTaskAction -Execute $powerShellExe -Argument $arguments
+    $at=[datetime]::Today.Add([timespan]::Parse($TimeText))
+    $trigger=if($Frequency -eq 'Daily'){New-ScheduledTaskTrigger -Daily -At $at}else{New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At $at}
+    $user=[Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $principal=New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    $settings=New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 3)
+    $taskName="WindowsMaintenancePro-$Preset"
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Windows Maintenance Pro $Preset ($Frequency)" -Force -ErrorAction Stop|Out-Null
+    Write-Log "Scheduled task registered: $taskName, $Frequency, $TimeText"
+}
+
+function New-ScheduleFromMenu([string]$Preset) {
+    Write-Host "`nD = Setiap hari`nW = Setiap Minggu (Minggu)`nN = Batal"
+    $frequencyKey=Read-OneKey 'DWN' 'Pilih frekuensi: '
+    if($frequencyKey -eq 'N'){return $false}
+    $frequency=if($frequencyKey -eq 'D'){'Daily'}else{'Weekly'}
+    $time=Read-Time24
+    if(-not $time){return $false}
+    if(-not(Read-Confirm "Jadwalkan preset $Preset, $frequency pukul $time?" 'Salinan skrip disimpan di ProgramData. Task berjalan dengan hak tertinggi hanya saat akun ini sedang login. Audit hanya membuat laporan; Protect menambah update signature dan Quick Scan Defender.')){return $false}
+    try{Register-MaintenanceSchedule $Preset $frequency $time;Write-Host '[SELESAI] Jadwal dibuat/diperbarui.';return $true}catch{Write-Host "[GAGAL] $($_.Exception.Message)";return $false}
+}
+
+function Invoke-Task37 {
+    $changed=$false
+    while($true){
+        Clear-Host
+        Write-Host "TUGAS 37 - MAINTENANCE SCHEDULER`n`nL = Lihat jadwal`nA = Jadwalkan preset Audit`nP = Jadwalkan preset Protect`nR = Hapus jadwal`nN = Kembali`n? = Informasi"
+        switch(Read-OneKey 'LAPRN?' 'Silakan pilih sesuai tombol: '){
+            'L' {Get-ScheduledTask -TaskName 'WindowsMaintenancePro-*' -ErrorAction SilentlyContinue|Select-Object TaskName,State,Description|Format-List;$changed=$true;Wait-Key}
+            'A' {if(New-ScheduleFromMenu 'Audit'){$changed=$true};Wait-Key}
+            'P' {if(New-ScheduleFromMenu 'Protect'){$changed=$true};Wait-Key}
+            'R' {Write-Host "`nA = Hapus Audit`nP = Hapus Protect`nN = Batal";$key=Read-OneKey 'APN' 'Pilih jadwal: ';if($key -ne 'N'){$preset=if($key -eq 'A'){'Audit'}else{'Protect'};$name="WindowsMaintenancePro-$preset";if(Read-Confirm "Hapus jadwal $preset?" 'Hanya scheduled task milik Windows Maintenance Pro yang dipilih yang dihapus.'){Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue;$changed=$true}};Wait-Key}
+            'N' {if($changed){$script:TaskResult='SELESAI'};return}
+            '?' {Write-Host 'Audit membuat laporan HTML. Protect memperbarui signature, menjalankan Quick Scan, lalu membuat laporan. Tidak ada update aplikasi, pembersihan file, atau perubahan registry tanpa pengawasan.';Wait-Key}
+        }
+    }
+}
+
+function Get-PresetTasks([string]$Preset) {
+    switch($Preset){
+        'Quick' {@('01','03','07','15','40')}
+        'Standard' {@('01','02','03','04','05','06','07','08','15','19','22','40')}
+        'Repair' {@('01','07','08','15','20','22','23','32','40')}
+        'Audit' {@('02','15','17','28','31','32','33','40')}
+        default {@()}
+    }
+}
+
+function Invoke-Task38 {
+    if(Show-ProfileMenu){$script:TaskResult='SELESAI'}
+}
+
+function Read-LocalFilePath([string]$Label) {
+    $inputPath=(Read-Host "$Label, kosong untuk batal").Trim().Trim([char]34)
+    if(-not $inputPath){return $null}
+    $expanded=[Environment]::ExpandEnvironmentVariables($inputPath)
+    if(-not(Test-Path -LiteralPath $expanded -PathType Leaf)){Write-Host '[GAGAL] File lokal tidak ditemukan.';return $null}
+    return (Resolve-Path -LiteralPath $expanded).Path
+}
+
+function Test-WingetConfigure {
+    if(-not(Test-Winget)){return $false}
+    & winget.exe configure --help *> $null
+    if($LASTEXITCODE -ne 0){Write-Host '[GAGAL] Winget Configuration memerlukan Winget 1.6 atau lebih baru.';return $false}
+    return $true
+}
+
+function Invoke-Task39 {
+    if(-not(Test-WingetConfigure)){return}
+    $used=$false
+    while($true){
+        Clear-Host
+        Write-Host "TUGAS 39 - WINGET CONFIGURATION`n`nL = Daftar configuration history`nS = Tampilkan file configuration`nV = Validasi file`nT = Test desired state`nA = Terapkan configuration`nE = Ekspor paket ke configuration`nN = Kembali`n? = Informasi"
+        switch(Read-OneKey 'LSVTAEN?' 'Silakan pilih sesuai tombol: '){
+            'L' {& winget.exe configure list;$used=$true;Wait-Key}
+            'S' {$file=Read-LocalFilePath 'Path file .winget/.yaml';if($file){& winget.exe configure show -f $file;$used=$true};Wait-Key}
+            'V' {$file=Read-LocalFilePath 'Path file .winget/.yaml';if($file){& winget.exe configure validate -f $file;$used=$true};Wait-Key}
+            'T' {$file=Read-LocalFilePath 'Path file .winget/.yaml';if($file){& winget.exe configure show -f $file;if($LASTEXITCODE -eq 0 -and (Read-Confirm 'Test desired state file ini?' 'Test mengevaluasi kesesuaian sistem tanpa menerapkan perubahan. Modul configuration mungkin diunduh.')){& winget.exe configure test -f $file;$used=$true}};Wait-Key}
+            'A' {$file=Read-LocalFilePath 'Path file .winget/.yaml';if($file){& winget.exe configure show -f $file;if($LASTEXITCODE -eq 0){& winget.exe configure validate -f $file};if($LASTEXITCODE -eq 0 -and (Read-Confirm 'Terapkan WinGet Configuration ini?' 'File dapat memasang paket dan mengubah sistem melalui DSC. Jalankan hanya file lokal yang telah diperiksa dan berasal dari sumber tepercaya.')){& winget.exe configure -f $file --accept-configuration-agreements;if($LASTEXITCODE -eq 0){$used=$true}else{Write-Host '[PERINGATAN] Configuration tidak selesai dengan sukses.'}}};Wait-Key}
+            'E' {if(Read-Confirm 'Ekspor seluruh paket Winget ke configuration?' 'Membuat file lokal sebagai rancangan reproducible setup; periksa file sebelum digunakan.'){ $out=Join-Path ([Environment]::GetFolderPath('Desktop')) "WinGet_Configuration_$($script:Stamp).winget";& winget.exe configure export --all -o $out;if($LASTEXITCODE -eq 0){Write-Host "File: $out";$used=$true} };Wait-Key}
+            'N' {if($used){$script:TaskResult='SELESAI'};return}
+            '?' {Write-Host 'Urutan aman: Show, Validate, Test, baru Apply. Skrip tidak mengunduh configuration dari URL dan tidak menjalankannya tanpa konfirmasi.';Wait-Key}
+        }
+    }
+}
+
+function ConvertTo-HtmlSection([string]$Title,[object[]]$Data) {
+    $heading="<h2>$Title</h2>"
+    if(-not $Data -or $Data.Count -eq 0){return $heading+'<p>Tidak tersedia.</p>'}
+    return $heading+($Data|ConvertTo-Html -Fragment)
+}
+
+function New-MaintenanceHtmlReport([string]$OutputPath) {
+    $os=Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $cs=Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $system=@([pscustomobject][ordered]@{Computer=$env:COMPUTERNAME;Windows=$os.Caption;Build=$os.BuildNumber;LastBoot=$os.LastBootUpTime;Manufacturer=$cs.Manufacturer;Model=$cs.Model;Generated=(Get-Date)})
+    $security=@(Get-SecurityOverview)
+    $volumes=@(Get-Volume -ErrorAction SilentlyContinue|Where-Object DriveLetter|ForEach-Object{[pscustomobject][ordered]@{Drive=$_.DriveLetter;Label=$_.FileSystemLabel;FileSystem=$_.FileSystem;Health=$_.HealthStatus;FreeGB=[math]::Round($_.SizeRemaining/1GB,1);SizeGB=[math]::Round($_.Size/1GB,1)}})
+    $services=@(Get-Service SysMain,WSearch,wuauserv,bits,Spooler -ErrorAction SilentlyContinue|Select-Object Name,Status,StartType)
+    $startup=@(Get-StartupRegistryEntries|Select-Object Scope,Name,Command)
+    $tasks=@($script:Status.GetEnumerator()|Sort-Object Name|ForEach-Object{[pscustomobject]@{Task=$_.Name;Status=$_.Value}})
+    $schedules=@(Get-ScheduledTask -TaskName 'WindowsMaintenancePro-*' -ErrorAction SilentlyContinue|Select-Object TaskName,State,Description)
+    $body=@()
+    $body+=ConvertTo-HtmlSection 'System' $system
+    $body+=ConvertTo-HtmlSection 'Security' $security
+    $body+=ConvertTo-HtmlSection 'Storage' $volumes
+    $body+=ConvertTo-HtmlSection 'Services' $services
+    $body+=ConvertTo-HtmlSection 'Registry Startup' $startup
+    $body+=ConvertTo-HtmlSection 'Maintenance Task Status' $tasks
+    $body+=ConvertTo-HtmlSection 'Maintenance Schedules' $schedules
+    $style=@'
+<style>
+body{font-family:Segoe UI,Arial,sans-serif;margin:28px;color:#172033;background:#f4f7fb}h1{color:#0b5cab}h2{margin-top:28px;color:#174a7e}table{border-collapse:collapse;width:100%;background:#fff;margin-top:8px}th,td{border:1px solid #d9e1ea;padding:8px;text-align:left;vertical-align:top}th{background:#e8f1fb}tr:nth-child(even){background:#f8fafc}.meta{color:#536273}
+</style>
+'@
+    $html=ConvertTo-Html -Title 'Windows Maintenance Pro Report' -Head $style -Body ((@("<h1>Windows Maintenance Pro $($script:AppVersion)</h1>","<p class='meta'>Report lokal. Tidak ada data yang dikirim keluar komputer.</p>")+$body) -join [Environment]::NewLine)
+    $parent=Split-Path -Parent $OutputPath;New-Item -ItemType Directory -Path $parent -Force|Out-Null
+    $html|Set-Content -LiteralPath $OutputPath -Encoding UTF8
+    return $OutputPath
+}
+
+function Invoke-Task40 {
+    if(-not(Read-Confirm 'Buat laporan kesehatan HTML?' 'Mengumpulkan status sistem, keamanan, storage, service, startup, tugas, dan jadwal. Laporan disimpan lokal di Desktop.')){return}
+    try{$file=Join-Path ([Environment]::GetFolderPath('Desktop')) "Windows_Maintenance_Report_$($script:Stamp).html";$result=New-MaintenanceHtmlReport $file;Write-Host "Laporan: $result";$script:TaskResult='SELESAI';if(Read-Confirm 'Buka laporan sekarang?' 'Membuka file HTML lokal dengan browser default.'){Start-Process $result}}catch{Write-Host "[GAGAL] $_";$script:TaskResult='GAGAL'}
+}
+
+function Invoke-ScheduledPreset {
+    Write-Log "Scheduled preset dimulai: $($script:ScheduledPreset)"
+    try{
+        if($script:ScheduledPreset -eq 'Protect'){
+            if((Get-Command Update-MpSignature -ErrorAction SilentlyContinue) -and (Get-Command Start-MpScan -ErrorAction SilentlyContinue)){Update-MpSignature -ErrorAction Continue;Start-MpScan -ScanType QuickScan -ErrorAction Continue}
+        }
+        $reportDir=Join-Path $script:ProgramRoot 'Reports'
+        $report=Join-Path $reportDir "Scheduled_$($script:ScheduledPreset)_$($script:Stamp).html"
+        [void](New-MaintenanceHtmlReport $report)
+        Write-Log "Scheduled preset selesai. Report: $report"
+    }catch{Write-Log "Scheduled preset gagal: $($_.Exception.Message)";throw}
+}
+
 function Show-ProfileMenu {
     while($true){
-        Clear-Host;Write-Host "PILIH PROFIL TUGAS`n`n1 = Cepat`n2 = Standar`n3 = Perbaikan`n4 = PowerShell Insight (read-only + restore point)`n5 = Kembali`n? = Informasi"
-        switch(Read-OneKey '12345?' 'Silakan pilih sesuai nomor: '){
-            '1' { '01','02','03','05','07','08','15'|ForEach-Object{Invoke-Task $_};return }
-            '2' { '01','02','03','04','05','06','07','08','15','19','22'|ForEach-Object{Invoke-Task $_};return }
-            '3' { '01','07','08','15','20','22','23'|ForEach-Object{Invoke-Task $_};return }
-            '4' { '29','31','32'|ForEach-Object{Invoke-Task $_};return }
-            '5' { return }
-            '?' { Write-Host 'Profil hanya menentukan urutan. Setiap tindakan tetap meminta konfirmasi.';Wait-Key }
+        Clear-Host;Write-Host "MAINTENANCE PRESETS`n`n1 = Quick`n2 = Standard`n3 = Repair`n4 = Audit / Insight`n5 = Kembali`n? = Informasi"
+        $choice=Read-OneKey '12345?' 'Silakan pilih sesuai nomor: '
+        switch($choice){
+            '1' { $preset='Quick' }
+            '2' { $preset='Standard' }
+            '3' { $preset='Repair' }
+            '4' { $preset='Audit' }
+            '5' { return $false }
+            '?' { Write-Host 'Preset hanya menentukan antrean. Dry Run dan konfirmasi pada setiap tugas tetap berlaku. Audit mengutamakan pembacaan dan laporan.';Wait-Key;continue }
         }
+        $tasks=@(Get-PresetTasks $preset)
+        Write-Host "`nPreset $preset`: $($tasks -join ', ')"
+        if(Read-Confirm "Jalankan preset $preset?" 'Setiap tugas tetap memiliki pengaman dan dapat dilewati.'){foreach($number in $tasks){Invoke-Task $number};return $true}
     }
 }
 
@@ -1073,35 +1600,53 @@ function Show-FinalAction {
     }
 }
 
+function Show-WelcomeScreen {
+    Clear-Host
+    try{$Host.UI.RawUI.WindowTitle="$($script:AppName) $($script:AppVersion)"}catch{}
+    Write-Host ('='*78) -ForegroundColor DarkCyan
+    Write-Host '  WINDOWS MAINTENANCE PRO' -ForegroundColor Cyan
+    Write-Host "  Control Center | $($script:AppVersion) | Windows 10/11" -ForegroundColor White
+    Write-Host ('='*78) -ForegroundColor DarkCyan
+    Write-Host '  40 tugas maintenance dalam 8 kategori terstruktur' -ForegroundColor Gray
+    Write-Host '  Navigasi satu tombol | Dry Run | Undo | Batch | Scheduler | Laporan' -ForegroundColor Gray
+    Write-Host '  Font, ukuran, zoom, dan warna terminal tetap mengikuti preferensi user' -ForegroundColor Gray
+    Write-Host ('-'*78) -ForegroundColor DarkGray
+    Write-Host '  Preflight memeriksa Windows, PowerShell, storage, daya, dan tools.' -ForegroundColor Yellow
+    Write-Host '  Setiap perubahan sistem interaktif tetap memerlukan konfirmasi.' -ForegroundColor Yellow
+    Write-Host ('-'*78) -ForegroundColor DarkGray
+}
+
 function Main {
     if(-not(Start-ElevatedCopy)){return}
     try {
-        New-Item -ItemType Directory -Path $script:RunDir,$script:BackupDir -Force -ErrorAction Stop|Out-Null
+        $folders=@($script:RunDir)
+        if(-not $script:ScheduledPreset){$folders+=$script:BackupDir}
+        New-Item -ItemType Directory -Path $folders -Force -ErrorAction Stop|Out-Null
     } catch {
         Write-Host "[GAGAL] Folder kerja tidak dapat dibuat: $($_.Exception.Message)" -ForegroundColor Red
+        if($script:ScheduledPreset){throw}
         Read-Host 'Tekan Enter untuk menutup';return
     }
     Write-Log 'Aplikasi dimulai.'
-    Clear-Host
-    Write-Host ('='*72);Write-Host "$($script:AppName) - $($script:AppVersion)";Write-Host ('='*72)
-    Write-Host 'Mengikuti font, ukuran, zoom, dan warna default terminal pengguna.'
-    Write-Host 'Semua pilihan tetap langsung diproses tanpa Enter; teks bebas tetap memakai Enter.'
+    if($script:ScheduledPreset){Invoke-ScheduledPreset;return}
+    Show-WelcomeScreen
     if(-not(Read-Confirm 'Mulai Windows Maintenance?' 'Menu mengurutkan tugas dari prioritas cepat sampai opsional/lama.')){return}
     if(-not(Show-Preflight)){Write-Log 'Preflight dibatalkan atau gagal.';return}
     $running=$true
     while($running){
         Clear-Host;Show-Dashboard
-        Write-Host "`nP = Profil tugas    B = Batch Task        D = Toggle Dry Run"
-        Write-Host "U = Undo Center     V = Integrity/Version  I = Informasi"
-        Write-Host "00 = Selesai / tindakan akhir              01-32 = Jalankan tugas"
-        $first=Read-OneKey '0123PIBDUV' 'Silakan pilih tombol atau dua digit nomor tugas: ' -NoEcho
-        if($first -eq 'P'){Show-ProfileMenu;continue}
+        $first=Read-OneKey '01234PIBDUVKFLR' '  Silakan pilih tombol atau dua digit nomor tugas: ' -NoEcho
+        if($first -eq 'K'){Write-Host 'K';Show-TaskCatalog;continue}
+        if($first -eq 'F'){Write-Host 'F';Show-TaskFinder;continue}
+        if($first -eq 'L'){Write-Host 'L';Clear-Host;Show-FullTaskList;Wait-Key;continue}
+        if($first -eq 'R'){Write-Host 'R';continue}
+        if($first -eq 'P'){[void](Show-ProfileMenu);continue}
         if($first -eq 'B'){Write-Host 'B';Show-BatchMenu;continue}
         if($first -eq 'D'){$script:DryRun=-not $script:DryRun;Write-Host "D`nMode Dry Run: $(if($script:DryRun){'AKTIF'}else{'NONAKTIF'})";Start-Sleep -Milliseconds 700;continue}
         if($first -eq 'U'){Write-Host 'U';Show-UndoCenter;continue}
         if($first -eq 'V'){Write-Host 'V';Show-IntegrityCenter;continue}
         if($first -eq 'I'){Write-Host 'I';Show-MainHelp;continue}
-        $allowed=if($first -eq '3'){'012'}else{'0123456789'}
+        $allowed=if($first -eq '4'){'0'}else{'0123456789'}
         $second=Read-OneKey $allowed 'Digit kedua: ' -NoEcho
         $number="$first$second";Write-Host "Pilihan: $number"
         if($number -eq '00'){Show-FinalAction;$running=$false}else{Invoke-Task $number}
@@ -1112,4 +1657,4 @@ function Main {
 }
 
 try { Main }
-catch { Write-Host "`n[KESALAHAN FATAL] $($_.Exception.Message)" -ForegroundColor Red; Write-Log "Fatal: $($_.Exception)"; Read-Host 'Tekan Enter untuk menutup' }
+catch { Write-Host "`n[KESALAHAN FATAL] $($_.Exception.Message)" -ForegroundColor Red; Write-Log "Fatal: $($_.Exception)"; if($script:ScheduledPreset){exit 1}else{Read-Host 'Tekan Enter untuk menutup'} }
