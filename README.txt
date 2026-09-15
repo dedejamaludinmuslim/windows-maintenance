@@ -1,13 +1,16 @@
-WINDOWS MAINTENANCE PRO v3.1 - POWERSHELL EDITION
+WINDOWS MAINTENANCE PRO v3.2 - POWERSHELL EDITION
 =================================================
 
 Windows Maintenance Pro adalah menu interaktif untuk pemeliharaan Windows 10/11.
-Versi 3.1 menambah lapisan keselamatan di atas 32 tugas PowerShell v3.0:
+Versi 3.2 mempertahankan 32 tugas dan seluruh lapisan keselamatan v3.1:
 Preflight Check, Dry Run, Undo Center, status live, Batch Task, dan Integrity Center.
+Dashboard kini mengumpulkan status secara senyap sebelum mencetak menu sekaligus.
+Pemeriksaan HTTPS tidak lagi memakai progress UI Test-NetConnection yang dapat
+menimpa baris daftar tugas.
 
 FILE UTAMA
 ----------
-Windows_Maintenance_Pro_v3.1_PowerShell.ps1
+Windows_Maintenance_Pro_v3.2_PowerShell.ps1
 
 PERSYARATAN
 -----------
@@ -24,7 +27,7 @@ CARA MENJALANKAN FILE LOKAL
 3. Buka Windows PowerShell.
 4. Jalankan perintah berikut dengan menyesuaikan path:
 
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Windows_Maintenance_Pro_v3.1_PowerShell.ps1"
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Windows_Maintenance_Pro_v3.2_PowerShell.ps1"
 
 Skrip akan meminta UAC secara otomatis bila belum dijalankan sebagai Administrator.
 Pengaturan ExecutionPolicy Bypass hanya berlaku pada proses tersebut dan tidak
@@ -35,10 +38,10 @@ SATU COMMAND DARI GITHUB
 Unggah file .ps1 ke repository GitHub publik. Buka file di GitHub, klik Raw, lalu
 salin URL Raw. Ganti MASUKKAN-URL-RAW dengan URL tersebut:
 
-$ErrorActionPreference='Stop';$u='https://raw.githubusercontent.com/dedejamaludinmuslim/windows-maintenance/refs/heads/main/Windows_Maintenance_Pro.ps1';$p=Join-Path $env:TEMP 'Windows_Maintenance_Pro.ps1';$h='884238178296c844fd6d8b5c4656a058d9d88a55465b3c608a02ddce247019c5';try{Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $p;if((Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant()-ne $h){throw 'SHA-256 tidak cocok; file tidak dijalankan.'};powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p}finally{Remove-Item $p -Force -ErrorAction SilentlyContinue}
+$ErrorActionPreference='Stop';$u='MASUKKAN-URL-RAW';$p=Join-Path $env:TEMP 'Windows_Maintenance_Pro_v3.2.ps1';$h='6c0fdc6b66920943e0274e39d8c12da394acc22f328ab9b4e92fa75ef18acae3';try{Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $p;if((Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant()-ne $h){throw 'SHA-256 tidak cocok; file tidak dijalankan.'};powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p}finally{Remove-Item $p -Force -ErrorAction SilentlyContinue}
 
-SHA-256 file resmi v3.1:
-884238178296c844fd6d8b5c4656a058d9d88a55465b3c608a02ddce247019c5
+SHA-256 file resmi v3.2:
+6c0fdc6b66920943e0274e39d8c12da394acc22f328ab9b4e92fa75ef18acae3
 
 Catatan:
 - Gunakan URL raw.githubusercontent.com, bukan URL yang mengandung /blob/.
@@ -60,7 +63,7 @@ INTERAKSI
 - U = membuka Undo Center.
 - V = menampilkan versi, SHA-256, dan status tanda tangan skrip.
 
-FITUR KESELAMATAN v3.1
+FITUR KESELAMATAN v3.2
 ----------------------
 1. Preflight Check
    Memeriksa versi Windows/PowerShell, Administrator, ruang kosong, daya baterai,
@@ -139,7 +142,7 @@ PEMULIHAN
 SARAN PUBLIKASI
 ---------------
 1. Simpan file .ps1 dan README.txt di repository.
-2. Buat GitHub Release, misalnya tag v3.1.
+2. Buat GitHub Release, misalnya tag v3.2.
 3. Lampirkan file .ps1 sebagai asset release.
 4. Publikasikan SHA-256 pada halaman release.
 5. Uji satu-command launcher pada Windows Sandbox atau VM sebelum dibagikan.

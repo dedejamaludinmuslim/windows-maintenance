@@ -1,6 +1,6 @@
 #requires -version 5.1
 <#
-Windows Maintenance Pro v3.1 - PowerShell Edition
+Windows Maintenance Pro v3.2 - PowerShell Edition
 Untuk Windows 10/11. Jalankan hanya dari sumber yang Anda percaya.
 #>
 
@@ -11,7 +11,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
 
 $script:AppName = 'Windows Maintenance Pro'
-$script:AppVersion = '3.1 PowerShell'
+$script:AppVersion = '3.2 PowerShell'
 $script:ProgramRoot = Join-Path $env:ProgramData 'WindowsMaintenancePro'
 $script:RunsRoot = Join-Path $script:ProgramRoot 'Runs'
 $script:Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -73,6 +73,24 @@ function Test-PendingReboot {
     } catch { return $false }
 }
 
+function Test-TcpPortSilent {
+    param(
+        [Parameter(Mandatory=$true)][string]$ComputerName,
+        [int]$Port = 443,
+        [int]$TimeoutMilliseconds = 3000
+    )
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $connectTask = $client.ConnectAsync($ComputerName, $Port)
+        if (-not $connectTask.Wait($TimeoutMilliseconds)) { return $false }
+        return $client.Connected
+    } catch {
+        return $false
+    } finally {
+        $client.Dispose()
+    }
+}
+
 function Get-PreflightReport {
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     $systemDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'" -ErrorAction SilentlyContinue
@@ -80,7 +98,7 @@ function Get-PreflightReport {
     $freeGB = if ($systemDrive) { [math]::Round($systemDrive.FreeSpace / 1GB, 1) } else { 0 }
     $power = if (-not $battery) { 'Desktop / tanpa baterai' } elseif ($battery.BatteryStatus -in 2,6,7,8,9,11) { 'Terhubung listrik' } else { "Baterai $($battery.EstimatedChargeRemaining)%" }
     $internet = $false
-    try { $internet = Test-NetConnection 'www.microsoft.com' -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction SilentlyContinue } catch {}
+    $internet = Test-TcpPortSilent -ComputerName 'www.microsoft.com' -Port 443 -TimeoutMilliseconds 3000
     $restore = if (Get-Command Checkpoint-Computer -ErrorAction SilentlyContinue) { 'Tersedia' } else { 'Tidak tersedia' }
     $items = @(
         [pscustomobject]@{Pemeriksaan='Windows';Status=$(if($os){"$($os.Caption) build $($os.BuildNumber)"}else{'Tidak terdeteksi'});Level=$(if($os){'OK'}else{'GAGAL'})},
@@ -481,57 +499,87 @@ function Show-IntegrityCenter {
     }
 }
 
+function Get-DashboardStateSnapshot {
+    $snapshot = @{}
+    $oldProgress = $ProgressPreference
+    $oldWarning = $WarningPreference
+    $oldVerbose = $VerbosePreference
+    $oldInformation = $InformationPreference
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        $WarningPreference = 'SilentlyContinue'
+        $VerbosePreference = 'SilentlyContinue'
+        $InformationPreference = 'SilentlyContinue'
+        foreach ($number in '05','07','09','10','11','12','13','25','26','29','30','32') {
+            $snapshot[$number] = [string](Get-StateSuffix $number)
+        }
+    } finally {
+        $ProgressPreference = $oldProgress
+        $WarningPreference = $oldWarning
+        $VerbosePreference = $oldVerbose
+        $InformationPreference = $oldInformation
+    }
+    return $snapshot
+}
+
 function Show-Dashboard {
-    Write-Host ('=' * 72)
-    Write-Host "$($script:AppName) - $($script:AppVersion)"
-    Write-Host ('=' * 72)
-    Write-Host "Mode Dry Run: $(if($script:DryRun){'AKTIF - tidak ada perubahan'}else{'NONAKTIF'})"
-    Write-Host
-    Write-Host '[A - PRIORITAS DAN CEPAT]'
-    Write-Host "[$($script:Status['01'])] 01. Backup konfigurasi dasar"
-    Write-Host "[$($script:Status['02'])] 02. Ekspor daftar aplikasi Winget"
-    Write-Host "[$($script:Status['03'])] 03. Bersihkan temporary files"
-    Write-Host "[$($script:Status['04'])] 04. Jalankan Disk Cleanup tanpa menunggu"
-    Write-Host
-    Write-Host '[B - UPDATE DAN KEAMANAN]'
-    Write-Host "[$($script:Status['05'])] 05. Manajemen aplikasi Winget$(Get-StateSuffix '05')"
-    Write-Host "[$($script:Status['06'])] 06. Buka Windows Update"
-    Write-Host "[$($script:Status['07'])] 07. Update dan Quick Scan Defender$(Get-StateSuffix '07')"
-    Write-Host
-    Write-Host '[C - PENGATURAN WINDOWS]'
-    Write-Host "[$($script:Status['08'])] 08. Pemeliharaan jaringan"
-    Write-Host "[$($script:Status['09'])] 09. Power Plan$(Get-StateSuffix '09')"
-    Write-Host "[$($script:Status['10'])] 10. Hibernate dan Fast Startup$(Get-StateSuffix '10')"
-    Write-Host "[$($script:Status['11'])] 11. Service SysMain$(Get-StateSuffix '11')"
-    Write-Host "[$($script:Status['12'])] 12. Windows Search Indexing$(Get-StateSuffix '12')"
-    Write-Host "[$($script:Status['13'])] 13. Settings Center$(Get-StateSuffix '13')"
-    Write-Host
-    Write-Host '[D - PRIVASI, LAPORAN, DAN BACKUP]'
-    Write-Host "[$($script:Status['14'])] 14. Registry Privacy Cleanup"
-    Write-Host "[$($script:Status['15'])] 15. Diagnosis sistem"
-    Write-Host "[$($script:Status['16'])] 16. Riwayat maintenance"
-    Write-Host "[$($script:Status['17'])] 17. Battery dan Energy Report"
-    Write-Host "[$($script:Status['18'])] 18. Backup driver pihak ketiga"
-    Write-Host
-    Write-Host '[E - OPSIONAL DAN LAMA]'
-    Write-Host "[$($script:Status['19'])] 19. Optimasi drive"
-    Write-Host "[$($script:Status['20'])] 20. CHKDSK online scan"
-    Write-Host "[$($script:Status['21'])] 21. Reset cache Windows Update"
-    Write-Host "[$($script:Status['22'])] 22. Component Store Cleanup"
-    Write-Host "[$($script:Status['23'])] 23. Perbaikan DISM dan SFC"
-    Write-Host
-    Write-Host '[F - TWEAK TAMBAHAN OPSIONAL]'
-    Write-Host "[$($script:Status['24'])] 24. Visual dan produktivitas Windows"
-    Write-Host "[$($script:Status['25'])] 25. Delivery Optimization$(Get-StateSuffix '25')"
-    Write-Host "[$($script:Status['26'])] 26. Storage Sense terkontrol$(Get-StateSuffix '26')"
-    Write-Host "[$($script:Status['27'])] 27. Pusat perbaikan cepat"
-    Write-Host "[$($script:Status['28'])] 28. Laporan Wi-Fi dan startup"
-    Write-Host
-    Write-Host '[G - KHUSUS POWERSHELL]'
-    Write-Host "[$($script:Status['29'])] 29. System Restore Point$(Get-StateSuffix '29')"
-    Write-Host "[$($script:Status['30'])] 30. Windows Update inline (WUA)$(Get-StateSuffix '30')"
-    Write-Host "[$($script:Status['31'])] 31. Diagnostik jaringan modern"
-    Write-Host "[$($script:Status['32'])] 32. Kesehatan storage PowerShell$(Get-StateSuffix '32')"
+    # Ambil seluruh status sebelum mencetak menu agar output pemeriksaan tidak
+    # dapat menyisip atau menimpa baris dashboard yang sudah tampil.
+    $live = Get-DashboardStateSnapshot
+    $dryRunText = if ($script:DryRun) { 'AKTIF - tidak ada perubahan' } else { 'NONAKTIF' }
+    $dashboard = @"
+========================================================================
+$($script:AppName) - $($script:AppVersion)
+========================================================================
+Mode Dry Run: $dryRunText
+
+[A - PRIORITAS DAN CEPAT]
+[$($script:Status['01'])] 01. Backup konfigurasi dasar
+[$($script:Status['02'])] 02. Ekspor daftar aplikasi Winget
+[$($script:Status['03'])] 03. Bersihkan temporary files
+[$($script:Status['04'])] 04. Jalankan Disk Cleanup tanpa menunggu
+
+[B - UPDATE DAN KEAMANAN]
+[$($script:Status['05'])] 05. Manajemen aplikasi Winget$($live['05'])
+[$($script:Status['06'])] 06. Buka Windows Update
+[$($script:Status['07'])] 07. Update dan Quick Scan Defender$($live['07'])
+
+[C - PENGATURAN WINDOWS]
+[$($script:Status['08'])] 08. Pemeliharaan jaringan
+[$($script:Status['09'])] 09. Power Plan$($live['09'])
+[$($script:Status['10'])] 10. Hibernate dan Fast Startup$($live['10'])
+[$($script:Status['11'])] 11. Service SysMain$($live['11'])
+[$($script:Status['12'])] 12. Windows Search Indexing$($live['12'])
+[$($script:Status['13'])] 13. Settings Center$($live['13'])
+
+[D - PRIVASI, LAPORAN, DAN BACKUP]
+[$($script:Status['14'])] 14. Registry Privacy Cleanup
+[$($script:Status['15'])] 15. Diagnosis sistem
+[$($script:Status['16'])] 16. Riwayat maintenance
+[$($script:Status['17'])] 17. Battery dan Energy Report
+[$($script:Status['18'])] 18. Backup driver pihak ketiga
+
+[E - OPSIONAL DAN LAMA]
+[$($script:Status['19'])] 19. Optimasi drive
+[$($script:Status['20'])] 20. CHKDSK online scan
+[$($script:Status['21'])] 21. Reset cache Windows Update
+[$($script:Status['22'])] 22. Component Store Cleanup
+[$($script:Status['23'])] 23. Perbaikan DISM dan SFC
+
+[F - TWEAK TAMBAHAN OPSIONAL]
+[$($script:Status['24'])] 24. Visual dan produktivitas Windows
+[$($script:Status['25'])] 25. Delivery Optimization$($live['25'])
+[$($script:Status['26'])] 26. Storage Sense terkontrol$($live['26'])
+[$($script:Status['27'])] 27. Pusat perbaikan cepat
+[$($script:Status['28'])] 28. Laporan Wi-Fi dan startup
+
+[G - KHUSUS POWERSHELL]
+[$($script:Status['29'])] 29. System Restore Point$($live['29'])
+[$($script:Status['30'])] 30. Windows Update inline (WUA)$($live['30'])
+[$($script:Status['31'])] 31. Diagnostik jaringan modern
+[$($script:Status['32'])] 32. Kesehatan storage PowerShell$($live['32'])
+"@
+    Write-Host $dashboard
 }
 
 function Show-MainHelp {
