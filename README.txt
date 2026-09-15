@@ -38,7 +38,7 @@ SATU COMMAND DARI GITHUB
 Unggah file .ps1 ke repository GitHub publik. Buka file di GitHub, klik Raw, lalu
 salin URL Raw. Ganti MASUKKAN-URL-RAW dengan URL tersebut:
 
-$ErrorActionPreference='Stop';$u='MASUKKAN-URL-RAW';$p=Join-Path $env:TEMP 'Windows_Maintenance_Pro_v3.4.ps1';$h='690f8e3bfe01b06e811955c25594e845bffa8267cbe1142d888dc27bded8752b';try{Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $p;if((Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant()-ne $h){throw 'SHA-256 tidak cocok; file tidak dijalankan.'};powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p}finally{Remove-Item $p -Force -ErrorAction SilentlyContinue}
+$ErrorActionPreference='Stop';$u='https://raw.githubusercontent.com/dedejamaludinmuslim/windows-maintenance/refs/heads/main/Windows_Maintenance_Pro.ps1';$p=Join-Path $env:TEMP 'Windows_Maintenance_Pro.ps1';$h='690f8e3bfe01b06e811955c25594e845bffa8267cbe1142d888dc27bded8752b';try{Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $p;if((Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant()-ne $h){throw 'SHA-256 tidak cocok; file tidak dijalankan.'};powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p}finally{Remove-Item $p -Force -ErrorAction SilentlyContinue}
 
 SHA-256 file resmi v3.4:
 690f8e3bfe01b06e811955c25594e845bffa8267cbe1142d888dc27bded8752b
