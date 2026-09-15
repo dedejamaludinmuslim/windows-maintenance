@@ -1,13 +1,13 @@
-WINDOWS MAINTENANCE PRO v3.0 - POWERSHELL EDITION
+WINDOWS MAINTENANCE PRO v3.1 - POWERSHELL EDITION
 =================================================
 
 Windows Maintenance Pro adalah menu interaktif untuk pemeliharaan Windows 10/11.
-Versi 3.0 memigrasikan mesin utama dari CMD ke Windows PowerShell 5.1 dan menambah
-fitur yang tidak praktis tersedia di CMD biasa.
+Versi 3.1 menambah lapisan keselamatan di atas 32 tugas PowerShell v3.0:
+Preflight Check, Dry Run, Undo Center, status live, Batch Task, dan Integrity Center.
 
 FILE UTAMA
 ----------
-Windows_Maintenance_Pro_v3.0_PowerShell.ps1
+Windows_Maintenance_Pro_v3.1_PowerShell.ps1
 
 PERSYARATAN
 -----------
@@ -24,7 +24,7 @@ CARA MENJALANKAN FILE LOKAL
 3. Buka Windows PowerShell.
 4. Jalankan perintah berikut dengan menyesuaikan path:
 
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Windows_Maintenance_Pro_v3.0_PowerShell.ps1"
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Windows_Maintenance_Pro_v3.1_PowerShell.ps1"
 
 Skrip akan meminta UAC secara otomatis bila belum dijalankan sebagai Administrator.
 Pengaturan ExecutionPolicy Bypass hanya berlaku pada proses tersebut dan tidak
@@ -35,10 +35,10 @@ SATU COMMAND DARI GITHUB
 Unggah file .ps1 ke repository GitHub publik. Buka file di GitHub, klik Raw, lalu
 salin URL Raw. Ganti MASUKKAN-URL-RAW dengan URL tersebut:
 
-$ErrorActionPreference='Stop';$u='https://raw.githubusercontent.com/dedejamaludinmuslim/windows-maintenance/refs/heads/main/Windows_Maintenance_Pro.ps1';$p=Join-Path $env:TEMP 'Windows_Maintenance_Pro.ps1';$h='0c90b68b6e86ec28d669071bff3a80486d2428a618b4d13fc360764352d27558';try{Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $p;if((Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant()-ne $h){throw 'SHA-256 tidak cocok; file tidak dijalankan.'};powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p}finally{Remove-Item $p -Force -ErrorAction SilentlyContinue}
+$ErrorActionPreference='Stop';$u='MASUKKAN-URL-RAW';$p=Join-Path $env:TEMP 'Windows_Maintenance_Pro_v3.1.ps1';$h='884238178296c844fd6d8b5c4656a058d9d88a55465b3c608a02ddce247019c5';try{Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $p;if((Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant()-ne $h){throw 'SHA-256 tidak cocok; file tidak dijalankan.'};powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p}finally{Remove-Item $p -Force -ErrorAction SilentlyContinue}
 
-SHA-256 file resmi v3.0:
-0c90b68b6e86ec28d669071bff3a80486d2428a618b4d13fc360764352d27558
+SHA-256 file resmi v3.1:
+884238178296c844fd6d8b5c4656a058d9d88a55465b3c608a02ddce247019c5
 
 Catatan:
 - Gunakan URL raw.githubusercontent.com, bukan URL yang mengandung /blob/.
@@ -55,6 +55,39 @@ INTERAKSI
 - Input teks bebas seperti Package ID Winget tetap memakai Enter.
 - Dashboard kembali muncul setelah setiap tugas selesai.
 - Tugas berstatus SELESAI meminta izin sebelum dieksekusi ulang.
+- D = mengaktifkan/nonaktifkan Dry Run.
+- B = memilih beberapa tugas dan meninjau urutannya sebelum dijalankan.
+- U = membuka Undo Center.
+- V = menampilkan versi, SHA-256, dan status tanda tangan skrip.
+
+FITUR KESELAMATAN v3.1
+----------------------
+1. Preflight Check
+   Memeriksa versi Windows/PowerShell, Administrator, ruang kosong, daya baterai,
+   internet, Winget, System Restore, dan pending restart sebelum menu dibuka.
+
+2. Dry Run
+   Saat aktif, pemilihan tugas hanya menampilkan tindakan, risiko, estimasi waktu,
+   kebutuhan restart, dan kemampuan Undo. Perintah pemeliharaan, Undo, restart,
+   maupun shutdown tidak dijalankan.
+
+3. Undo Center
+   Mencatat keadaan awal registry, power plan, Hibernate, SysMain, Windows Search,
+   dan Windows Firewall ke CSV. Record dijalankan kembali dari urutan terakhir.
+   Pembersihan file, update, DISM/SFC, uninstall aplikasi, dan reset Winsock tidak
+   diberi Undo otomatis karena pemulihannya tidak dapat dijamin.
+
+4. Status Live
+   Dashboard menampilkan status penting seperti Defender, power plan, Hibernate,
+   service, Firewall, kebijakan Storage Sense, pending restart, dan kesehatan disk.
+
+5. Batch Task
+   Tugas 01-32 dapat dipilih menggunakan dua digit tanpa Enter, ditinjau bersama,
+   kemudian dijalankan sesuai urutan. Konfirmasi setiap tugas tetap dipertahankan.
+
+6. Integrity Center
+   Menampilkan SHA-256 file yang sedang berjalan dan status Authenticode. Self-update
+   tidak menjalankan file remote sebelum repository dan checksum tepercaya tersedia.
 
 FITUR
 -----
@@ -63,7 +96,7 @@ Defender, jaringan, power plan, service, pengaturan Windows, laporan, driver,
 optimasi drive, CHKDSK, Windows Update cache, DISM/SFC, tweak visual, Delivery
 Optimization, Storage Sense, dan perbaikan cepat.
 
-Fitur khusus PowerShell:
+Fitur khusus PowerShell yang dipertahankan dari v3.0:
 29. Membuat dan menampilkan System Restore Point.
 30. Scan, download, dan instal Windows Update melalui Windows Update Agent (WUA).
 31. Diagnostik jaringan modern memakai objek NetTCPIP/DNS PowerShell.
@@ -88,6 +121,10 @@ LOG DAN BACKUP
 Log per eksekusi:
 C:\ProgramData\WindowsMaintenancePro\Runs\<timestamp>\maintenance.log
 
+Preflight dan Undo:
+C:\ProgramData\WindowsMaintenancePro\Runs\<timestamp>\preflight.csv
+C:\ProgramData\WindowsMaintenancePro\Runs\<timestamp>\undo-state.csv
+
 Backup per eksekusi:
 Desktop\Windows_Maintenance_Backup_<timestamp>
 
@@ -102,7 +139,7 @@ PEMULIHAN
 SARAN PUBLIKASI
 ---------------
 1. Simpan file .ps1 dan README.txt di repository.
-2. Buat GitHub Release, misalnya tag v3.0.
+2. Buat GitHub Release, misalnya tag v3.1.
 3. Lampirkan file .ps1 sebagai asset release.
 4. Publikasikan SHA-256 pada halaman release.
 5. Uji satu-command launcher pada Windows Sandbox atau VM sebelum dibagikan.

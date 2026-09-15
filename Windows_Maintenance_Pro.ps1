@@ -1,6 +1,6 @@
 #requires -version 5.1
 <#
-Windows Maintenance Pro v3.0 - PowerShell Edition
+Windows Maintenance Pro v3.1 - PowerShell Edition
 Untuk Windows 10/11. Jalankan hanya dari sumber yang Anda percaya.
 #>
 
@@ -11,16 +11,22 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
 
 $script:AppName = 'Windows Maintenance Pro'
-$script:AppVersion = '3.0 PowerShell'
+$script:AppVersion = '3.1 PowerShell'
 $script:ProgramRoot = Join-Path $env:ProgramData 'WindowsMaintenancePro'
 $script:RunsRoot = Join-Path $script:ProgramRoot 'Runs'
 $script:Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $script:RunDir = Join-Path $script:RunsRoot $script:Stamp
 $script:BackupDir = Join-Path ([Environment]::GetFolderPath('Desktop')) "Windows_Maintenance_Backup_$($script:Stamp)"
 $script:LogFile = Join-Path $script:RunDir 'maintenance.log'
+$script:UndoFile = Join-Path $script:RunDir 'undo-state.csv'
 $script:TaskResult = 'LEWATI'
+$script:DryRun = $false
+$script:RepositoryUrl = ''
+$script:RepositoryRawUrl = ''
 $script:Status = @{}
 1..32 | ForEach-Object { $script:Status[('{0:D2}' -f $_)] = 'ANTRI' }
+$script:UndoKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+$script:BatchSelected = New-Object 'System.Collections.Generic.HashSet[string]'
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -53,6 +59,156 @@ function Start-ElevatedCopy {
 
 function Write-Log([string]$Message) {
     try { Add-Content -LiteralPath $script:LogFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message" -Encoding UTF8 } catch {}
+}
+
+function Test-PendingReboot {
+    $paths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+    if ($paths | Where-Object { Test-Path $_ }) { return $true }
+    try {
+        $value = Get-ItemPropertyValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'PendingFileRenameOperations' -ErrorAction Stop
+        return $null -ne $value
+    } catch { return $false }
+}
+
+function Get-PreflightReport {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $systemDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'" -ErrorAction SilentlyContinue
+    $battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
+    $freeGB = if ($systemDrive) { [math]::Round($systemDrive.FreeSpace / 1GB, 1) } else { 0 }
+    $power = if (-not $battery) { 'Desktop / tanpa baterai' } elseif ($battery.BatteryStatus -in 2,6,7,8,9,11) { 'Terhubung listrik' } else { "Baterai $($battery.EstimatedChargeRemaining)%" }
+    $internet = $false
+    try { $internet = Test-NetConnection 'www.microsoft.com' -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction SilentlyContinue } catch {}
+    $restore = if (Get-Command Checkpoint-Computer -ErrorAction SilentlyContinue) { 'Tersedia' } else { 'Tidak tersedia' }
+    $items = @(
+        [pscustomobject]@{Pemeriksaan='Windows';Status=$(if($os){"$($os.Caption) build $($os.BuildNumber)"}else{'Tidak terdeteksi'});Level=$(if($os){'OK'}else{'GAGAL'})},
+        [pscustomobject]@{Pemeriksaan='PowerShell';Status="$($PSVersionTable.PSVersion) / $($PSVersionTable.PSEdition)";Level=$(if($PSVersionTable.PSVersion.Major -eq 5 -and $PSVersionTable.PSEdition -eq 'Desktop'){'OK'}else{'GAGAL'})},
+        [pscustomobject]@{Pemeriksaan='Administrator';Status=$(if(Test-IsAdministrator){'Ya'}else{'Tidak'});Level=$(if(Test-IsAdministrator){'OK'}else{'GAGAL'})},
+        [pscustomobject]@{Pemeriksaan='Ruang drive sistem';Status="$freeGB GB bebas";Level=$(if($freeGB -ge 15){'OK'}elseif($freeGB -ge 5){'PERINGATAN'}else{'GAGAL'})},
+        [pscustomobject]@{Pemeriksaan='Daya';Status=$power;Level=$(if($battery -and $battery.BatteryStatus -notin 2,6,7,8,9,11 -and $battery.EstimatedChargeRemaining -lt 40){'PERINGATAN'}else{'OK'})},
+        [pscustomobject]@{Pemeriksaan='Internet HTTPS';Status=$(if($internet){'Terhubung'}else{'Tidak terdeteksi'});Level=$(if($internet){'OK'}else{'PERINGATAN'})},
+        [pscustomobject]@{Pemeriksaan='Winget';Status=$(if(Get-Command winget.exe -ErrorAction SilentlyContinue){'Tersedia'}else{'Tidak tersedia'});Level=$(if(Get-Command winget.exe -ErrorAction SilentlyContinue){'OK'}else{'PERINGATAN'})},
+        [pscustomobject]@{Pemeriksaan='System Restore';Status=$restore;Level=$(if($restore -eq 'Tersedia'){'OK'}else{'PERINGATAN'})},
+        [pscustomobject]@{Pemeriksaan='Pending restart';Status=$(if(Test-PendingReboot){'Ya'}else{'Tidak'});Level=$(if(Test-PendingReboot){'PERINGATAN'}else{'OK'})}
+    )
+    return $items
+}
+
+function Show-Preflight {
+    Clear-Host
+    Write-Host ('=' * 72)
+    Write-Host 'PREFLIGHT CHECK'
+    Write-Host ('=' * 72)
+    $report = @(Get-PreflightReport)
+    $report | Format-Table Pemeriksaan,Status,Level -AutoSize
+    $report | Export-Csv (Join-Path $script:RunDir 'preflight.csv') -NoTypeInformation -Encoding UTF8
+    $critical = @($report | Where-Object Level -eq 'GAGAL')
+    $warnings = @($report | Where-Object Level -eq 'PERINGATAN')
+    if ($critical.Count) {
+        Write-Host '[GAGAL] Preflight menemukan kondisi kritis. Eksekusi dihentikan.' -ForegroundColor Red
+        Wait-Key
+        return $false
+    }
+    if ($warnings.Count) {
+        Write-Host "[PERINGATAN] Ditemukan $($warnings.Count) kondisi yang perlu diperhatikan." -ForegroundColor Yellow
+        return (Read-Confirm 'Tetap lanjut ke menu?' 'Tugas yang membutuhkan komponen yang tidak tersedia dapat gagal atau dilewati.')
+    }
+    Write-Host '[OK] Pemeriksaan awal tidak menemukan masalah kritis.' -ForegroundColor Green
+    return $true
+}
+
+function Add-UndoRecord {
+    param([string]$Type,[string]$Target,[string]$Name,[string]$Exists,[string]$Value,[string]$Extra)
+    $key = "$Type|$Target|$Name"
+    if (-not $script:UndoKeys.Add($key)) { return }
+    $record = [pscustomobject][ordered]@{
+        Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Type = $Type; Target = $Target; Name = $Name; Exists = $Exists; Value = $Value; Extra = $Extra
+    }
+    $record | Export-Csv -LiteralPath $script:UndoFile -NoTypeInformation -Append -Encoding UTF8
+}
+
+function ConvertTo-UndoText([object]$Value) {
+    if ($null -eq $Value) { return '' }
+    return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes([string]$Value))
+}
+
+function ConvertFrom-UndoText([string]$Value) {
+    if ([string]::IsNullOrEmpty($Value)) { return '' }
+    return [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Value))
+}
+
+function Register-RegistryUndo([string]$Path,[string]$Name) {
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $exists = $item.GetValueNames() -contains $Name
+        if ($exists) {
+            $value = $item.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $kind = $item.GetValueKind($Name).ToString()
+            Add-UndoRecord 'Registry' $Path $Name 'True' (ConvertTo-UndoText $value) $kind
+        } else { Add-UndoRecord 'Registry' $Path $Name 'False' '' '' }
+    } catch { Add-UndoRecord 'Registry' $Path $Name 'False' '' '' }
+}
+
+function Register-PowerPlanUndo {
+    $text = (& powercfg.exe /getactivescheme 2>$null) -join ' '
+    if ($text -match '([0-9a-fA-F-]{36})') { Add-UndoRecord 'PowerPlan' $matches[1] '' 'True' '' '' }
+}
+
+function Register-HibernateUndo {
+    try { $value = Get-ItemPropertyValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' 'HibernateEnabled' -ErrorAction Stop } catch { $value = 0 }
+    Add-UndoRecord 'Hibernate' 'System' 'HibernateEnabled' 'True' ([string]$value) ''
+}
+
+function Register-ServiceUndo([string]$Name) {
+    $service = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+    if ($service) { Add-UndoRecord 'Service' $Name '' 'True' $service.State $service.StartMode }
+}
+
+function Register-FirewallUndo {
+    foreach ($profile in Get-NetFirewallProfile -ErrorAction SilentlyContinue) {
+        Add-UndoRecord 'Firewall' $profile.Name 'Enabled' 'True' ([string]$profile.Enabled) ''
+    }
+}
+
+function Invoke-UndoFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Host '[GAGAL] File Undo tidak ditemukan.'; return $false }
+    $records = @(Import-Csv -LiteralPath $Path)
+    [array]::Reverse($records)
+    $failed = 0
+    foreach ($record in $records) {
+        try {
+            switch ($record.Type) {
+                'Registry' {
+                    if ($record.Exists -eq 'True') {
+                        New-Item -Path $record.Target -Force | Out-Null
+                        New-ItemProperty -LiteralPath $record.Target -Name $record.Name -Value (ConvertFrom-UndoText $record.Value) -PropertyType $record.Extra -Force | Out-Null
+                    } else { Remove-ItemProperty -LiteralPath $record.Target -Name $record.Name -ErrorAction SilentlyContinue }
+                }
+                'PowerPlan' { & powercfg.exe /setactive $record.Target | Out-Null }
+                'Hibernate' { if ([int]$record.Value -eq 1) { & powercfg.exe /hibernate on } else { & powercfg.exe /hibernate off } }
+                'Service' {
+                    $startup = switch ($record.Extra) {'Auto'{'Automatic'};'Manual'{'Manual'};'Disabled'{'Disabled'};default{'Manual'}}
+                    Set-Service -Name $record.Target -StartupType $startup
+                    if ($record.Value -eq 'Running') { Start-Service $record.Target -ErrorAction SilentlyContinue } else { Stop-Service $record.Target -Force -ErrorAction SilentlyContinue }
+                }
+                'Firewall' { Set-NetFirewallProfile -Name $record.Target -Enabled ([bool]::Parse($record.Value)) }
+            }
+        } catch { $failed++; Write-Host "[GAGAL] Undo $($record.Type) $($record.Target): $($_.Exception.Message)" -ForegroundColor Red }
+    }
+    if ($failed -eq 0) {
+        $archive = Join-Path (Split-Path $Path -Parent) "undo-applied_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+        Move-Item -LiteralPath $Path -Destination $archive -Force
+        if ([IO.Path]::GetFullPath($Path) -eq [IO.Path]::GetFullPath($script:UndoFile)) { $script:UndoKeys.Clear() }
+        Write-Log "Undo berhasil dari $Path"
+        Write-Host '[SELESAI] Semua perubahan yang tercatat berhasil dipulihkan.' -ForegroundColor Green
+        return $true
+    }
+    Write-Log "Undo dari $Path selesai dengan $failed kegagalan"
+    Write-Host "[PERINGATAN] Undo selesai dengan $failed kegagalan." -ForegroundColor Yellow
+    return $false
 }
 
 function Read-OneKey {
@@ -126,10 +282,210 @@ function Backup-RegistryKey([string]$Key, [string]$File) {
     } catch {}
 }
 
+function New-TaskPlan([string]$Number,[string]$Action,[string]$Risk,[string]$Duration,[string]$Restart,[string]$Undo) {
+    return [pscustomobject][ordered]@{No=$Number;Tindakan=$Action;Risiko=$Risk;Durasi=$Duration;Restart=$Restart;Undo=$Undo}
+}
+
+function Get-TaskPlan([string]$Number) {
+    switch ($Number) {
+        '01' { New-TaskPlan $Number 'Mengekspor konfigurasi dasar' 'Rendah' '<1 menit' 'Tidak' 'Tidak perlu' }
+        '02' { New-TaskPlan $Number 'Mengekspor inventaris Winget' 'Rendah' '<1 menit' 'Tidak' 'Tidak perlu' }
+        '03' { New-TaskPlan $Number 'Menghapus isi TEMP pengguna dan Windows' 'Sedang' '1-5 menit' 'Tidak' 'Tidak otomatis' }
+        '04' { New-TaskPlan $Number 'Menjalankan Disk Cleanup terpisah' 'Sedang' 'Bervariasi' 'Tidak' 'Tidak otomatis' }
+        '05' { New-TaskPlan $Number 'Winget install/update/uninstall/pin sesuai submenu' 'Sedang' 'Bervariasi' 'Mungkin' 'Sebagian manual' }
+        '06' { New-TaskPlan $Number 'Membuka halaman Windows Update' 'Rendah' '<1 menit' 'Tidak' 'Tidak perlu' }
+        '07' { New-TaskPlan $Number 'Update signature dan Quick Scan Defender' 'Rendah' '5-30 menit' 'Tidak' 'Tidak perlu' }
+        '08' { New-TaskPlan $Number 'Flush DNS atau reset Winsock' 'Sedang' '<2 menit' 'Winsock: Ya' 'Winsock tidak otomatis' }
+        '09' { New-TaskPlan $Number 'Mengubah power plan' 'Sedang' '<1 menit' 'Tidak' 'Otomatis' }
+        '10' { New-TaskPlan $Number 'Mengubah Hibernate/Fast Startup' 'Sedang' '<1 menit' 'Tidak' 'Otomatis' }
+        '11' { New-TaskPlan $Number 'Mengubah service SysMain' 'Sedang' '<1 menit' 'Mungkin' 'Otomatis' }
+        '12' { New-TaskPlan $Number 'Mengubah service Windows Search' 'Sedang' '<1 menit' 'Mungkin' 'Otomatis' }
+        '13' { New-TaskPlan $Number 'Mengubah Explorer/Firewall atau membuka Settings' 'Sedang' '<1 menit' 'Mungkin' 'Otomatis untuk perubahan inti' }
+        '14' { New-TaskPlan $Number 'Mencadangkan dan menghapus tiga riwayat pengguna' 'Sedang' '<1 menit' 'Tidak' 'File .reg' }
+        '15' { New-TaskPlan $Number 'Membuat laporan diagnosis sistem' 'Rendah' '2-10 menit' 'Tidak' 'Tidak perlu' }
+        '16' { New-TaskPlan $Number 'Menampilkan riwayat maintenance' 'Rendah' '<1 menit' 'Tidak' 'Tidak perlu' }
+        '17' { New-TaskPlan $Number 'Membuat Battery dan Energy Report' 'Rendah' '~1 menit' 'Tidak' 'Tidak perlu' }
+        '18' { New-TaskPlan $Number 'Mengekspor driver pihak ketiga' 'Rendah' '5-20 menit' 'Tidak' 'Tidak perlu' }
+        '19' { New-TaskPlan $Number 'Menjalankan optimasi drive sesuai media' 'Sedang' '5-60 menit' 'Tidak' 'Tidak otomatis' }
+        '20' { New-TaskPlan $Number 'Memindai filesystem secara online' 'Rendah' '5-60 menit' 'Mungkin' 'Tidak perlu' }
+        '21' { New-TaskPlan $Number 'Menghentikan service dan membersihkan cache update' 'Tinggi' '2-10 menit' 'Mungkin' 'Tidak otomatis' }
+        '22' { New-TaskPlan $Number 'Scan dan cleanup Component Store' 'Sedang' '10-60 menit' 'Mungkin' 'Tidak otomatis' }
+        '23' { New-TaskPlan $Number 'DISM RestoreHealth lalu SFC' 'Sedang' '20-120 menit' 'Disarankan' 'Tidak otomatis' }
+        '24' { New-TaskPlan $Number 'Mengubah visual/taskbar sesuai submenu' 'Sedang' '<2 menit' 'Sign-out mungkin' 'Otomatis + .reg' }
+        '25' { New-TaskPlan $Number 'Mengubah kebijakan Delivery Optimization' 'Sedang' '<1 menit' 'Tidak' 'Otomatis + .reg' }
+        '26' { New-TaskPlan $Number 'Mengubah kebijakan Storage Sense' 'Sedang' '<1 menit' 'Tidak' 'Otomatis + .reg' }
+        '27' { New-TaskPlan $Number 'Reset Store/waktu/antrean cetak sesuai submenu' 'Sedang' '1-10 menit' 'Mungkin' 'Sebagian tidak otomatis' }
+        '28' { New-TaskPlan $Number 'Membuat laporan Wi-Fi atau startup' 'Rendah' '1-5 menit' 'Tidak' 'Tidak perlu' }
+        '29' { New-TaskPlan $Number 'Membuat System Restore Point' 'Rendah' '1-3 menit' 'Tidak' 'Restore Point' }
+        '30' { New-TaskPlan $Number 'Scan/download/install Windows Update' 'Tinggi' '10-180 menit' 'Mungkin' 'Windows rollback terbatas' }
+        '31' { New-TaskPlan $Number 'Membuat laporan jaringan modern' 'Rendah' '1-5 menit' 'Tidak' 'Tidak perlu' }
+        '32' { New-TaskPlan $Number 'Status/reliability/scan storage' 'Sedang' '1-60 menit' 'Mungkin' 'Tidak perlu' }
+        default { New-TaskPlan $Number 'Tugas tidak dikenal' 'Tidak diketahui' '-' '-' '-' }
+    }
+}
+
+function Get-TaskCommandSummary([string]$Number) {
+    switch ($Number) {
+        '01' {'powercfg; Get-Service; reg export; netsh firewall export; Get-NetIPConfiguration'}
+        '02' {'winget export'}
+        '03' {'Get-ChildItem | Remove-Item pada dua folder TEMP'}
+        '04' {'cleanmgr.exe /sageset dan /sagerun'}
+        '05' {'winget list/search/show/install/upgrade/uninstall/pin/export sesuai submenu'}
+        '06' {'Start-Process ms-settings:windowsupdate'}
+        '07' {'Update-MpSignature; Start-MpScan -ScanType QuickScan'}
+        '08' {'Clear-DnsClientCache atau netsh winsock reset'}
+        '09' {'powercfg.exe /setactive'}
+        '10' {'powercfg.exe /hibernate on|off'}
+        '11' {'Set-Service/Start-Service/Stop-Service SysMain'}
+        '12' {'Set-Service/Start-Service/Stop-Service WSearch'}
+        '13' {'Registry Explorer; Set-NetFirewallProfile; ms-settings'}
+        '14' {'reg export lalu reg delete pada RunMRU, TypedPaths, RecentDocs'}
+        '15' {'Get-ComputerInfo/Get-CimInstance/Get-WinEvent dan laporan TXT'}
+        '16' {'Get-ChildItem riwayat run'}
+        '17' {'powercfg.exe /batteryreport dan /energy'}
+        '18' {'pnputil.exe /enum-drivers dan /export-driver'}
+        '19' {'defrag.exe /O /U /V'}
+        '20' {'chkdsk.exe /scan'}
+        '21' {'Stop-Service wuauserv,bits; hapus cache Download; Start-Service'}
+        '22' {'DISM /ScanHealth dan /StartComponentCleanup'}
+        '23' {'DISM /RestoreHealth; sfc.exe /scannow'}
+        '24' {'Backup registry lalu New/Remove-ItemProperty untuk visual/taskbar'}
+        '25' {'Backup registry lalu ubah DODownloadMode'}
+        '26' {'Backup registry lalu ubah kebijakan Storage Sense'}
+        '27' {'wsreset.exe; w32tm.exe; atau reset Print Spooler'}
+        '28' {'netsh wlan show wlanreport atau inventaris CIM/ScheduledTask'}
+        '29' {'Checkpoint-Computer -RestorePointType MODIFY_SETTINGS'}
+        '30' {'Microsoft.Update.Session COM: Search/Download/Install'}
+        '31' {'Get-NetAdapter/Get-NetIPConfiguration/Get-NetTCPConnection/Test-NetConnection'}
+        '32' {'Get-PhysicalDisk/Get-StorageReliabilityCounter/Repair-Volume -Scan'}
+        default {'Tidak tersedia'}
+    }
+}
+
+function Show-TaskPlan([string]$Number) {
+    $plan = Get-TaskPlan $Number
+    Write-Host "`nPRATINJAU TUGAS $Number" -ForegroundColor Cyan
+    $plan | Format-List No,Tindakan,Risiko,Durasi,Restart,Undo
+    Write-Host "Perintah     : $(Get-TaskCommandSummary $Number)"
+    if ($plan.Risiko -eq 'Tinggi') { Write-Host '[RISIKO TINGGI] Pastikan backup dan daya stabil.' -ForegroundColor Yellow }
+}
+
+function Get-LiveState([string]$Number) {
+    try {
+        switch ($Number) {
+            '05' { if(Get-Command winget.exe -ErrorAction SilentlyContinue){'Winget siap'}else{'Winget tidak ada'} }
+            '07' { $d=Get-MpComputerStatus -ErrorAction Stop; if($d.RealTimeProtectionEnabled){'Proteksi aktif'}else{'Proteksi nonaktif'} }
+            '09' { $t=(& powercfg.exe /getactivescheme 2>$null)-join ' '; if($t -match '\(([^)]+)\)'){$matches[1]}else{'Tidak terdeteksi'} }
+            '10' { $h=Get-ItemPropertyValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' HibernateEnabled -ErrorAction Stop; if($h){'Hibernate aktif'}else{'Hibernate nonaktif'} }
+            '11' { $s=Get-Service SysMain -ErrorAction Stop; "$($s.Status)" }
+            '12' { $s=Get-Service WSearch -ErrorAction Stop; "$($s.Status)" }
+            '13' { $f=@(Get-NetFirewallProfile -ErrorAction Stop|Where-Object{-not $_.Enabled});if($f.Count){"$($f.Count) firewall nonaktif"}else{'Firewall aktif'} }
+            '25' { $v=Get-ItemPropertyValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' DODownloadMode -ErrorAction SilentlyContinue; if($null -eq $v){'Default'}else{"Mode $v"} }
+            '26' { $v=Get-ItemPropertyValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\StorageSense' AllowStorageSenseGlobal -ErrorAction SilentlyContinue;if($null -eq $v){'Default'}elseif($v){'Policy aktif'}else{'Policy nonaktif'} }
+            '29' { $r=@(Get-ComputerRestorePoint -ErrorAction Stop);if($r.Count){"$($r.Count) restore point"}else{'Belum ada'} }
+            '30' { if(Test-PendingReboot){'Restart tertunda'}else{'WUA siap'} }
+            '32' { $bad=@(Get-PhysicalDisk -ErrorAction Stop|Where-Object HealthStatus -ne 'Healthy');if($bad.Count){"$($bad.Count) disk bermasalah"}else{'Disk healthy'} }
+            default { '' }
+        }
+    } catch { 'Status N/A' }
+}
+
+function Get-StateSuffix([string]$Number) {
+    $state = Get-LiveState $Number
+    if ($state) { return " <$state>" }
+    return ''
+}
+
+function Show-BatchMenu {
+    while ($true) {
+        Clear-Host
+        Write-Host ('=' * 72)
+        Write-Host 'BATCH TASK'
+        Write-Host ('=' * 72)
+        $selected = @($script:BatchSelected | Sort-Object)
+        Write-Host "Terpilih: $(if($selected.Count){$selected -join ', '}else{'belum ada'})"
+        Write-Host "`nTekan dua digit 01-32 untuk memilih/membatalkan pilihan."
+        Write-Host "R = Tinjau dan jalankan`nC = Kosongkan pilihan`nN = Kembali`n? = Informasi"
+        $first = Read-OneKey '0123RCN?' 'Silakan pilih: ' -NoEcho
+        if ($first -eq 'R') {
+            Write-Host 'R'
+            if (-not $selected.Count) { Write-Host 'Belum ada tugas terpilih.'; Wait-Key; continue }
+            $plans = @($selected | ForEach-Object { Get-TaskPlan $_ })
+            $plans | Format-Table No,Tindakan,Risiko,Durasi,Restart -Wrap
+            if ($script:DryRun) { Write-Host "`n[DRY RUN] Batch hanya ditampilkan; tidak ada tugas dijalankan." -ForegroundColor Cyan; Wait-Key; continue }
+            if (Read-Confirm 'Jalankan seluruh batch sesuai urutan?' 'Setiap tugas tetap menampilkan submenu/konfirmasi sendiri dan dapat dilewati.') {
+                foreach ($number in $selected) { Invoke-Task $number }
+                $script:BatchSelected.Clear()
+            }
+            continue
+        }
+        if ($first -eq 'C') { Write-Host 'C'; $script:BatchSelected.Clear(); continue }
+        if ($first -eq 'N') { Write-Host 'N'; return }
+        if ($first -eq '?') { Write-Host "?`nBatch menyusun antrean. Tugas dijalankan berurutan dan konfirmasi per tugas tetap berlaku."; Wait-Key; continue }
+        $allowed = if ($first -eq '3') {'012'} else {'0123456789'}
+        $second = Read-OneKey $allowed 'Digit kedua: ' -NoEcho
+        $number = "$first$second"; Write-Host $number
+        if ($number -eq '00') { continue }
+        if ($script:BatchSelected.Contains($number)) { [void]$script:BatchSelected.Remove($number) } else { [void]$script:BatchSelected.Add($number) }
+    }
+}
+
+function Show-UndoCenter {
+    while ($true) {
+        Clear-Host
+        Write-Host ('=' * 72); Write-Host 'UNDO CENTER'; Write-Host ('=' * 72)
+        $files = @(Get-ChildItem $script:RunsRoot -Filter 'undo-state.csv' -File -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 9)
+        if ($files.Count) {
+            for ($i=0;$i -lt $files.Count;$i++) { Write-Host "$($i+1) = $($files[$i].Directory.Name) ($($files[$i].LastWriteTime))" }
+        } else { Write-Host 'Belum ada perubahan otomatis yang dapat dipulihkan.' }
+        Write-Host "`nN = Kembali`n? = Informasi"
+        $allowed = 'N?'
+        for ($i=1;$i -le $files.Count;$i++) { $allowed += [string]$i }
+        $choice = Read-OneKey $allowed 'Silakan pilih: '
+        if ($choice -eq 'N') { return }
+        if ($choice -eq '?') { Write-Host "`nUndo bekerja hanya untuk perubahan yang dicatat: registry, power plan, Hibernate, service, dan Firewall.`nPembersihan file, update, DISM, uninstall aplikasi, dan reset Winsock tidak dibalik otomatis."; Wait-Key; continue }
+        $index = [int]$choice - 1
+        $target = $files[$index]
+        if ($script:DryRun) {
+            $count = @(Import-Csv -LiteralPath $target.FullName).Count
+            Write-Host "[DRY RUN] $count record Undo akan dipulihkan; belum ada perubahan dijalankan." -ForegroundColor Cyan
+            Wait-Key
+            continue
+        }
+        if (Read-Confirm "Pulihkan perubahan sesi $($target.Directory.Name)?" 'Record dijalankan dari perubahan terakhir ke pertama. Proses tidak dapat dibatalkan di tengah jalan.') {
+            if (Invoke-UndoFile $target.FullName) { '09','10','11','12','13','24','25','26' | ForEach-Object { $script:Status[$_] = 'ANTRI' } }
+            Wait-Key
+        }
+    }
+}
+
+function Show-IntegrityCenter {
+    while ($true) {
+        Clear-Host
+        Write-Host ('=' * 72); Write-Host 'INTEGRITY DAN VERSION CENTER'; Write-Host ('=' * 72)
+        Write-Host "Versi       : $($script:AppVersion)"
+        Write-Host "File        : $PSCommandPath"
+        if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
+            $hash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $signature = Get-AuthenticodeSignature -LiteralPath $PSCommandPath
+            Write-Host "SHA-256     : $hash"
+            Write-Host "Tanda tangan: $($signature.Status)"
+        }
+        Write-Host "Repository  : $(if($script:RepositoryUrl){$script:RepositoryUrl}else{'Belum dikonfigurasi'})"
+        Write-Host "`nO = Buka repository`nN = Kembali`n? = Informasi"
+        switch (Read-OneKey 'ON?' 'Silakan pilih: ') {
+            'O' { if($script:RepositoryUrl){Start-Process $script:RepositoryUrl}else{Write-Host 'Isi RepositoryUrl di bagian awal skrip setelah repo resmi tersedia.';Wait-Key} }
+            'N' { return }
+            '?' { Write-Host "`nStatus NotSigned normal untuk pengembangan lokal. Publikasi resmi sebaiknya memakai GitHub Release bertag, SHA-256, dan kemudian Authenticode.`nSelf-update sengaja tidak mengeksekusi file remote tanpa checksum tepercaya."; Wait-Key }
+        }
+    }
+}
+
 function Show-Dashboard {
     Write-Host ('=' * 72)
     Write-Host "$($script:AppName) - $($script:AppVersion)"
     Write-Host ('=' * 72)
+    Write-Host "Mode Dry Run: $(if($script:DryRun){'AKTIF - tidak ada perubahan'}else{'NONAKTIF'})"
     Write-Host
     Write-Host '[A - PRIORITAS DAN CEPAT]'
     Write-Host "[$($script:Status['01'])] 01. Backup konfigurasi dasar"
@@ -138,17 +494,17 @@ function Show-Dashboard {
     Write-Host "[$($script:Status['04'])] 04. Jalankan Disk Cleanup tanpa menunggu"
     Write-Host
     Write-Host '[B - UPDATE DAN KEAMANAN]'
-    Write-Host "[$($script:Status['05'])] 05. Manajemen aplikasi Winget"
+    Write-Host "[$($script:Status['05'])] 05. Manajemen aplikasi Winget$(Get-StateSuffix '05')"
     Write-Host "[$($script:Status['06'])] 06. Buka Windows Update"
-    Write-Host "[$($script:Status['07'])] 07. Update dan Quick Scan Defender"
+    Write-Host "[$($script:Status['07'])] 07. Update dan Quick Scan Defender$(Get-StateSuffix '07')"
     Write-Host
     Write-Host '[C - PENGATURAN WINDOWS]'
     Write-Host "[$($script:Status['08'])] 08. Pemeliharaan jaringan"
-    Write-Host "[$($script:Status['09'])] 09. Power Plan"
-    Write-Host "[$($script:Status['10'])] 10. Hibernate dan Fast Startup"
-    Write-Host "[$($script:Status['11'])] 11. Service SysMain"
-    Write-Host "[$($script:Status['12'])] 12. Windows Search Indexing"
-    Write-Host "[$($script:Status['13'])] 13. Settings Center"
+    Write-Host "[$($script:Status['09'])] 09. Power Plan$(Get-StateSuffix '09')"
+    Write-Host "[$($script:Status['10'])] 10. Hibernate dan Fast Startup$(Get-StateSuffix '10')"
+    Write-Host "[$($script:Status['11'])] 11. Service SysMain$(Get-StateSuffix '11')"
+    Write-Host "[$($script:Status['12'])] 12. Windows Search Indexing$(Get-StateSuffix '12')"
+    Write-Host "[$($script:Status['13'])] 13. Settings Center$(Get-StateSuffix '13')"
     Write-Host
     Write-Host '[D - PRIVASI, LAPORAN, DAN BACKUP]'
     Write-Host "[$($script:Status['14'])] 14. Registry Privacy Cleanup"
@@ -166,16 +522,16 @@ function Show-Dashboard {
     Write-Host
     Write-Host '[F - TWEAK TAMBAHAN OPSIONAL]'
     Write-Host "[$($script:Status['24'])] 24. Visual dan produktivitas Windows"
-    Write-Host "[$($script:Status['25'])] 25. Delivery Optimization"
-    Write-Host "[$($script:Status['26'])] 26. Storage Sense terkontrol"
+    Write-Host "[$($script:Status['25'])] 25. Delivery Optimization$(Get-StateSuffix '25')"
+    Write-Host "[$($script:Status['26'])] 26. Storage Sense terkontrol$(Get-StateSuffix '26')"
     Write-Host "[$($script:Status['27'])] 27. Pusat perbaikan cepat"
     Write-Host "[$($script:Status['28'])] 28. Laporan Wi-Fi dan startup"
     Write-Host
     Write-Host '[G - KHUSUS POWERSHELL]'
-    Write-Host "[$($script:Status['29'])] 29. System Restore Point"
-    Write-Host "[$($script:Status['30'])] 30. Windows Update inline (WUA)"
+    Write-Host "[$($script:Status['29'])] 29. System Restore Point$(Get-StateSuffix '29')"
+    Write-Host "[$($script:Status['30'])] 30. Windows Update inline (WUA)$(Get-StateSuffix '30')"
     Write-Host "[$($script:Status['31'])] 31. Diagnostik jaringan modern"
-    Write-Host "[$($script:Status['32'])] 32. Kesehatan storage PowerShell"
+    Write-Host "[$($script:Status['32'])] 32. Kesehatan storage PowerShell$(Get-StateSuffix '32')"
 }
 
 function Show-MainHelp {
@@ -186,13 +542,22 @@ INFORMASI
 - Semua menu dan konfirmasi langsung diproses dengan satu tombol.
 - Pada konfirmasi Y/N/?, tombol ? menampilkan informasi lalu mengulang pertanyaan.
 - Enter hanya dipakai untuk teks bebas seperti Package ID.
+- D mengaktifkan Dry Run; tugas hanya menampilkan rencana dan tidak dieksekusi.
+- B membuka Batch Task; U membuka Undo Center; V membuka Integrity Center.
 - Tugas berstatus SELESAI meminta izin sebelum dijalankan ulang.
-- ANTRI = belum dijalankan; LEWATI = dibatalkan; GAGAL = terjadi error.
+- ANTRI = belum dijalankan; PRATINJAU = Dry Run; LEWATI = dibatalkan; GAGAL = error.
 '@
     Wait-Key
 }
 
 function Invoke-Task([string]$Number) {
+    if ($script:DryRun) {
+        Show-TaskPlan $Number
+        $script:Status[$Number] = 'PRATINJAU'
+        Write-Log "Dry Run tugas $Number"
+        Wait-Key
+        return
+    }
     if ($script:Status[$Number] -eq 'SELESAI') {
         if (-not (Read-Confirm "Tugas $Number sudah selesai. Jalankan ulang?" 'Pengaman ini mencegah eksekusi ganda.')) { return }
     }
@@ -381,9 +746,9 @@ function Invoke-Task09 {
     Write-Host "`nTUGAS 09 - POWER PLAN"; & powercfg.exe /getactivescheme
     Write-Host "`nU = Ultimate Performance`nH = High Performance`nB = Balanced`nN = Tidak mengubah`n? = Informasi"
     switch (Read-OneKey 'UHBN?' 'Silakan pilih sesuai tombol: ') {
-        'U' { if (Read-Confirm 'Aktifkan Ultimate Performance?' 'Cocok untuk desktop/workstation. Daya, panas, dan kipas dapat meningkat.') { $guid='6fecc5ae-f350-48a5-b669-b472cb895ccf'; $list=& powercfg.exe /list; if ($list -notmatch $guid) { & powercfg.exe /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 $guid *> $null }; & powercfg.exe /setactive $guid; $script:TaskResult=if($LASTEXITCODE -eq 0){'SELESAI'}else{'GAGAL'} } }
-        'H' { if (Read-Confirm 'Aktifkan High Performance?' 'Daya, panas, dan aktivitas kipas dapat meningkat.') { & powercfg.exe /setactive SCHEME_MIN; $script:TaskResult=if($LASTEXITCODE -eq 0){'SELESAI'}else{'GAGAL'} } }
-        'B' { if (Read-Confirm 'Aktifkan Balanced?' 'Balanced biasanya paling sesuai untuk penggunaan umum.') { & powercfg.exe /setactive SCHEME_BALANCED; $script:TaskResult=if($LASTEXITCODE -eq 0){'SELESAI'}else{'GAGAL'} } }
+        'U' { if (Read-Confirm 'Aktifkan Ultimate Performance?' 'Cocok untuk desktop/workstation. Daya, panas, dan kipas dapat meningkat.') { Register-PowerPlanUndo; $guid='6fecc5ae-f350-48a5-b669-b472cb895ccf'; $list=& powercfg.exe /list; if ($list -notmatch $guid) { & powercfg.exe /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 $guid *> $null }; & powercfg.exe /setactive $guid; $script:TaskResult=if($LASTEXITCODE -eq 0){'SELESAI'}else{'GAGAL'} } }
+        'H' { if (Read-Confirm 'Aktifkan High Performance?' 'Daya, panas, dan aktivitas kipas dapat meningkat.') { Register-PowerPlanUndo; & powercfg.exe /setactive SCHEME_MIN; $script:TaskResult=if($LASTEXITCODE -eq 0){'SELESAI'}else{'GAGAL'} } }
+        'B' { if (Read-Confirm 'Aktifkan Balanced?' 'Balanced biasanya paling sesuai untuk penggunaan umum.') { Register-PowerPlanUndo; & powercfg.exe /setactive SCHEME_BALANCED; $script:TaskResult=if($LASTEXITCODE -eq 0){'SELESAI'}else{'GAGAL'} } }
         '?' { Write-Host 'Ultimate/High Performance lebih boros daya; Balanced dinamis.'; Wait-Key; Invoke-Task09 }
     }
 }
@@ -391,8 +756,8 @@ function Invoke-Task09 {
 function Invoke-Task10 {
     Write-Host "`nTUGAS 10 - HIBERNATE DAN FAST STARTUP`nE = Aktifkan Hibernate`nD = Nonaktifkan Hibernate + Fast Startup`nN = Tidak mengubah`n? = Informasi"
     switch (Read-OneKey 'EDN?' 'Silakan pilih sesuai tombol: ') {
-        'E' { if (Read-Confirm 'Aktifkan Hibernate?' 'Windows membuat atau menggunakan hiberfil.sys.') { & powercfg.exe /hibernate on; $script:TaskResult=if($LASTEXITCODE -eq 0){'SELESAI'}else{'GAGAL'} } }
-        'D' { if (Read-Confirm 'Nonaktifkan Hibernate dan Fast Startup?' 'hiberfil.sys dihapus sehingga ruang disk bertambah.') { & powercfg.exe /hibernate off; $script:TaskResult=if($LASTEXITCODE -eq 0){'SELESAI'}else{'GAGAL'} } }
+        'E' { if (Read-Confirm 'Aktifkan Hibernate?' 'Windows membuat atau menggunakan hiberfil.sys.') { Register-HibernateUndo; & powercfg.exe /hibernate on; $script:TaskResult=if($LASTEXITCODE -eq 0){'SELESAI'}else{'GAGAL'} } }
+        'D' { if (Read-Confirm 'Nonaktifkan Hibernate dan Fast Startup?' 'hiberfil.sys dihapus sehingga ruang disk bertambah.') { Register-HibernateUndo; & powercfg.exe /hibernate off; $script:TaskResult=if($LASTEXITCODE -eq 0){'SELESAI'}else{'GAGAL'} } }
         '?' { Write-Host 'Menonaktifkan Hibernate juga menonaktifkan Fast Startup.'; Wait-Key; Invoke-Task10 }
     }
 }
@@ -403,8 +768,8 @@ function Show-ServiceMenu([string]$Name,[string]$Display,[string]$Warning) {
     $service | Format-List Name,DisplayName,Status,StartType
     Write-Host "E = Aktifkan + Automatic`nD = Nonaktifkan`nN = Tidak mengubah`n? = Informasi"
     switch (Read-OneKey 'EDN?' 'Silakan pilih sesuai tombol: ') {
-        'E' { if (Read-Confirm "Aktifkan $Display?" 'Service diatur Automatic dan dicoba dijalankan.') { Set-Service $Name -StartupType Automatic; Start-Service $Name -ErrorAction SilentlyContinue; $script:TaskResult='SELESAI' } }
-        'D' { if (Read-Confirm "Nonaktifkan $Display?" $Warning) { Stop-Service $Name -Force -ErrorAction SilentlyContinue; Set-Service $Name -StartupType Disabled; $script:TaskResult='SELESAI' } }
+        'E' { if (Read-Confirm "Aktifkan $Display?" 'Service diatur Automatic dan dicoba dijalankan.') { Register-ServiceUndo $Name; Set-Service $Name -StartupType Automatic; Start-Service $Name -ErrorAction SilentlyContinue; $script:TaskResult='SELESAI' } }
+        'D' { if (Read-Confirm "Nonaktifkan $Display?" $Warning) { Register-ServiceUndo $Name; Stop-Service $Name -Force -ErrorAction SilentlyContinue; Set-Service $Name -StartupType Disabled; $script:TaskResult='SELESAI' } }
         '?' { Write-Host $Warning; Wait-Key; Show-ServiceMenu $Name $Display $Warning }
     }
 }
@@ -416,9 +781,9 @@ function Invoke-Task13 {
     while($true) {
         Clear-Host; Write-Host "TUGAS 13 - SETTINGS CENTER`n`nF = Tampilkan ekstensi file`nH = Tampilkan file tersembunyi`nA = Aktifkan Windows Firewall`nT = Buka Startup Apps`nU = Buka Windows Update`nS = Status`nN = Kembali`n? = Informasi"
         switch(Read-OneKey 'FHATUSN?' 'Silakan pilih sesuai tombol: ') {
-            'F' { if(Read-Confirm 'Tampilkan ekstensi nama file?' 'Ekstensi membantu mengenali tipe file dan file berbahaya.') { Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' HideFileExt 0; $changed=$true }; Wait-Key }
-            'H' { if(Read-Confirm 'Tampilkan file tersembunyi?' 'File sistem terlindungi mengikuti pengaturan terpisah.') { Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' Hidden 1; $changed=$true }; Wait-Key }
-            'A' { if(Read-Confirm 'Aktifkan seluruh profil Windows Firewall?' 'Kebijakan organisasi tetap dapat mengubah hasil akhir.') { Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True; $changed=$true }; Wait-Key }
+            'F' { if(Read-Confirm 'Tampilkan ekstensi nama file?' 'Ekstensi membantu mengenali tipe file dan file berbahaya.') { Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' HideFileExt 0 DWord; $changed=$true }; Wait-Key }
+            'H' { if(Read-Confirm 'Tampilkan file tersembunyi?' 'File sistem terlindungi mengikuti pengaturan terpisah.') { Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' Hidden 1 DWord; $changed=$true }; Wait-Key }
+            'A' { if(Read-Confirm 'Aktifkan seluruh profil Windows Firewall?' 'Kebijakan organisasi tetap dapat mengubah hasil akhir.') { Register-FirewallUndo; Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True; $changed=$true }; Wait-Key }
             'T' { Start-Process 'ms-settings:startupapps' }
             'U' { Start-Process 'ms-settings:windowsupdate' }
             'S' { Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' HideFileExt,Hidden; Get-NetFirewallProfile | Format-Table Name,Enabled; & powercfg.exe /getactivescheme; Wait-Key }
@@ -483,7 +848,7 @@ function Backup-VisualRegistry {
     Backup-RegistryKey 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' (Join-Path $dir 'Explorer-VisualEffects.reg')
     Backup-RegistryKey 'HKCU\Software\Microsoft\Windows\DWM' (Join-Path $dir 'DWM.reg')
 }
-function Set-RegValue([string]$Path,[string]$Name,[object]$Value,[Microsoft.Win32.RegistryValueKind]$Type) { New-Item $Path -Force|Out-Null; New-ItemProperty $Path $Name -Value $Value -PropertyType $Type -Force|Out-Null }
+function Set-RegValue([string]$Path,[string]$Name,[object]$Value,[Microsoft.Win32.RegistryValueKind]$Type) { Register-RegistryUndo $Path $Name; New-Item $Path -Force|Out-Null; New-ItemProperty $Path $Name -Value $Value -PropertyType $Type -Force|Out-Null }
 
 function Invoke-Task24 {
     $changed=$false
@@ -493,7 +858,7 @@ function Invoke-Task24 {
             'L' { if(Read-Confirm 'Aktifkan mode visual ringan?' 'Mengurangi animasi, bayangan, Aero Peek, dan delay menu; dampak performa biasanya kecil.') { Backup-VisualRegistry; Set-RegValue 'HKCU:\Control Panel\Desktop' DragFullWindows '0' String; Set-RegValue 'HKCU:\Control Panel\Desktop' MenuShowDelay '200' String; Set-RegValue 'HKCU:\Control Panel\Desktop\WindowMetrics' MinAnimate '0' String; Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' ListviewAlphaSelect 0 DWord; Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' ListviewShadow 0 DWord; Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' TaskbarAnimations 0 DWord; Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' VisualFXSetting 3 DWord; Set-RegValue 'HKCU:\Software\Microsoft\Windows\DWM' EnableAeroPeek 0 DWord; $changed=$true }; Wait-Key }
             'R' { if(Read-Confirm 'Pulihkan visual ke nilai umum Windows?' 'Jika sebelumnya kustom, gunakan backup .reg untuk pemulihan persis.') { Backup-VisualRegistry; Set-RegValue 'HKCU:\Control Panel\Desktop' DragFullWindows '1' String; Set-RegValue 'HKCU:\Control Panel\Desktop' MenuShowDelay '400' String; Set-RegValue 'HKCU:\Control Panel\Desktop\WindowMetrics' MinAnimate '1' String; Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' ListviewAlphaSelect 1 DWord; Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' ListviewShadow 1 DWord; Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' TaskbarAnimations 1 DWord; Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' VisualFXSetting 1 DWord; Set-RegValue 'HKCU:\Software\Microsoft\Windows\DWM' EnableAeroPeek 1 DWord; $changed=$true }; Wait-Key }
             'E' { if(Read-Confirm 'Aktifkan End Task pada taskbar?' 'Menutup paksa dapat menghilangkan data aplikasi yang belum disimpan.') { Backup-VisualRegistry; Set-RegValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings' TaskbarEndTask 1 DWord; $changed=$true }; Wait-Key }
-            'D' { if(Read-Confirm 'Nonaktifkan End Task pada taskbar?' 'Nilai tambahan dihapus agar mengikuti Windows.') { Backup-VisualRegistry; Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings' TaskbarEndTask -ErrorAction SilentlyContinue; $changed=$true }; Wait-Key }
+            'D' { if(Read-Confirm 'Nonaktifkan End Task pada taskbar?' 'Nilai tambahan dihapus agar mengikuti Windows.') { Backup-VisualRegistry; Register-RegistryUndo 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings' TaskbarEndTask; Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings' TaskbarEndTask -ErrorAction SilentlyContinue; $changed=$true }; Wait-Key }
             'S' { Get-ItemProperty 'HKCU:\Control Panel\Desktop' DragFullWindows,MenuShowDelay; Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' TaskbarAnimations; Wait-Key }
             'N' { if($changed){$script:TaskResult='SELESAI'}; return }
             '?' { Write-Host 'Mode ringan bukan penambah FPS ajaib. Registry dicadangkan sebelum perubahan.'; Wait-Key }
@@ -508,7 +873,7 @@ function Invoke-Task25 {
         switch(Read-OneKey 'HLRSN?' 'Silakan pilih sesuai tombol: '){
             'H' { if(Read-Confirm 'Gunakan HTTP tanpa peer-to-peer?' 'Windows Update tidak berbagi bagian update ke PC lain.') { Backup-RegistryKey 'HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' (Join-Path $script:BackupDir 'DeliveryOptimization.reg'); Set-RegValue $path DODownloadMode 0 DWord; $changed=$true }; Wait-Key }
             'L' { if(Read-Confirm 'Batasi peer sharing ke LAN?' 'Dapat menghemat internet bila beberapa PC memakai LAN yang sama.') { Backup-RegistryKey 'HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' (Join-Path $script:BackupDir 'DeliveryOptimization.reg'); Set-RegValue $path DODownloadMode 1 DWord; $changed=$true }; Wait-Key }
-            'R' { if(Read-Confirm 'Hapus kebijakan Delivery Optimization?' 'Kembali mengikuti pengaturan pengguna/organisasi/default.') { Remove-ItemProperty $path DODownloadMode -ErrorAction SilentlyContinue; $changed=$true }; Wait-Key }
+            'R' { if(Read-Confirm 'Hapus kebijakan Delivery Optimization?' 'Kembali mengikuti pengaturan pengguna/organisasi/default.') { Register-RegistryUndo $path DODownloadMode; Remove-ItemProperty $path DODownloadMode -ErrorAction SilentlyContinue; $changed=$true }; Wait-Key }
             'S' { Get-ItemProperty $path -ErrorAction SilentlyContinue; Wait-Key }
             'N' { if($changed){$script:TaskResult='SELESAI'}; return }
             '?' { Write-Host 'Mode 0 = HTTP tanpa peer; mode 1 = peer dalam LAN.'; Wait-Key }
@@ -522,7 +887,7 @@ function Invoke-Task26 {
         Clear-Host; Write-Host "TUGAS 26 - STORAGE SENSE`n`nE = Mingguan, temp + Recycle Bin 30 hari`nR = Hapus kebijakan`nO = Buka pengaturan`nS = Status`nN = Kembali`n? = Informasi"
         switch(Read-OneKey 'EROSN?' 'Silakan pilih sesuai tombol: '){
             'E' { if(Read-Confirm 'Aktifkan Storage Sense mingguan?' 'Temp dan Recycle Bin >30 hari dapat dihapus; Downloads tidak disentuh.') { Backup-RegistryKey 'HKLM\SOFTWARE\Policies\Microsoft\Windows\StorageSense' (Join-Path $script:BackupDir 'StorageSense.reg'); Set-RegValue $path AllowStorageSenseGlobal 1 DWord; Set-RegValue $path AllowStorageSenseTemporaryFilesCleanup 1 DWord; Set-RegValue $path ConfigStorageSenseGlobalCadence 7 DWord; Set-RegValue $path ConfigStorageSenseRecycleBinCleanupThreshold 30 DWord; $changed=$true }; Wait-Key }
-            'R' { if(Read-Confirm 'Hapus kebijakan Storage Sense?' 'Kembali ke pilihan pengguna atau kebijakan organisasi.') { 'AllowStorageSenseGlobal','AllowStorageSenseTemporaryFilesCleanup','ConfigStorageSenseGlobalCadence','ConfigStorageSenseRecycleBinCleanupThreshold'|ForEach-Object{Remove-ItemProperty $path $_ -ErrorAction SilentlyContinue};$changed=$true }; Wait-Key }
+            'R' { if(Read-Confirm 'Hapus kebijakan Storage Sense?' 'Kembali ke pilihan pengguna atau kebijakan organisasi.') { 'AllowStorageSenseGlobal','AllowStorageSenseTemporaryFilesCleanup','ConfigStorageSenseGlobalCadence','ConfigStorageSenseRecycleBinCleanupThreshold'|ForEach-Object{Register-RegistryUndo $path $_;Remove-ItemProperty $path $_ -ErrorAction SilentlyContinue};$changed=$true }; Wait-Key }
             'O' { Start-Process 'ms-settings:storagesense' }
             'S' { Get-ItemProperty $path -ErrorAction SilentlyContinue; Wait-Key }
             'N' { if($changed){$script:TaskResult='SELESAI'}; return }
@@ -644,7 +1009,13 @@ function Show-ProfileMenu {
 function Show-FinalAction {
     while($true){
         Clear-Host;Write-Host "TINDAKAN AKHIR`n`nR = Restart dalam 15 menit`nS = Shutdown dalam 15 menit`nM = Tetap menyala`nA = Batalkan shutdown/restart terjadwal`n? = Informasi"
-        switch(Read-OneKey 'RSMA?' 'Silakan pilih sesuai tombol: '){
+        $choice = Read-OneKey 'RSMA?' 'Silakan pilih sesuai tombol: '
+        if ($script:DryRun -and $choice -in 'R','S','A') {
+            Write-Host "[DRY RUN] Tindakan $choice hanya dipratinjau; shutdown.exe tidak dijalankan." -ForegroundColor Cyan
+            Wait-Key
+            continue
+        }
+        switch($choice){
             'R' { if(Read-Confirm 'Jadwalkan restart dalam 15 menit?' 'Simpan pekerjaan. Jadwal dapat dibatalkan dengan shutdown /a.') { & shutdown.exe /r /t 900 /c 'Windows Maintenance Pro selesai. Restart dalam 15 menit.' };return }
             'S' { if(Read-Confirm 'Jadwalkan shutdown dalam 15 menit?' 'Simpan pekerjaan. Jadwal dapat dibatalkan dengan shutdown /a.') { & shutdown.exe /s /t 900 /c 'Windows Maintenance Pro selesai. Shutdown dalam 15 menit.' };return }
             'M' { return }
@@ -668,12 +1039,19 @@ function Main {
     Write-Host 'Mengikuti font, ukuran, zoom, dan warna default terminal pengguna.'
     Write-Host 'Semua pilihan tetap langsung diproses tanpa Enter; teks bebas tetap memakai Enter.'
     if(-not(Read-Confirm 'Mulai Windows Maintenance?' 'Menu mengurutkan tugas dari prioritas cepat sampai opsional/lama.')){return}
+    if(-not(Show-Preflight)){Write-Log 'Preflight dibatalkan atau gagal.';return}
     $running=$true
     while($running){
         Clear-Host;Show-Dashboard
-        Write-Host "`nP = Pilih profil tugas`n00 = Selesai / tindakan akhir`nI = Informasi`n01-32 = Jalankan tugas berdasarkan nomor"
-        $first=Read-OneKey '0123PI' 'Tekan dua digit nomor tugas, P, atau I: ' -NoEcho
+        Write-Host "`nP = Profil tugas    B = Batch Task        D = Toggle Dry Run"
+        Write-Host "U = Undo Center     V = Integrity/Version  I = Informasi"
+        Write-Host "00 = Selesai / tindakan akhir              01-32 = Jalankan tugas"
+        $first=Read-OneKey '0123PIBDUV' 'Silakan pilih tombol atau dua digit nomor tugas: ' -NoEcho
         if($first -eq 'P'){Show-ProfileMenu;continue}
+        if($first -eq 'B'){Write-Host 'B';Show-BatchMenu;continue}
+        if($first -eq 'D'){$script:DryRun=-not $script:DryRun;Write-Host "D`nMode Dry Run: $(if($script:DryRun){'AKTIF'}else{'NONAKTIF'})";Start-Sleep -Milliseconds 700;continue}
+        if($first -eq 'U'){Write-Host 'U';Show-UndoCenter;continue}
+        if($first -eq 'V'){Write-Host 'V';Show-IntegrityCenter;continue}
         if($first -eq 'I'){Write-Host 'I';Show-MainHelp;continue}
         $allowed=if($first -eq '3'){'012'}else{'0123456789'}
         $second=Read-OneKey $allowed 'Digit kedua: ' -NoEcho
